@@ -1,0 +1,38 @@
+# Kestrel runtime dependencies
+# Install: python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
+
+# Data fetching
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+
+# Data handling
+pandas>=2.0
+pyarrow>=14.0
+
+# Broker
+kiteconnect>=4.2
+pyotp>=2.9
+
+# LLM (primary)
+anthropic>=0.40
+
+# LLM (council second voice — Google Gemini via API key)
+google-genai>=1.0
+
+# LLM (fallback / offline)
+ollama>=0.4
+
+# News + sentiment (Stage 3)
+# Note: install CPU-only torch first to avoid pulling the CUDA build:
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+transformers>=4.40
+feedparser>=6.0
+
+# Press scraping (Stage 3)
+# After install, run: playwright install chromium  (~110MB browser binary)
+playwright>=1.50
+trafilatura>=2.0
+
+# Testing
+pytest>=8.0
