@@ -1,13 +1,13 @@
-"""Canonical research vault.
+"""Engram: per-symbol long-term research memory.
 
-Per-stock markdown dossier at `vault/{SYMBOL}/dossier.md` for picks currently
-in tier A/B/C. The vault is the stable context layer that downstream agents
-will eventually read from (instead of refetching news/filings each run),
-killing the cross-run variance problem at the source.
+One markdown dossier per name under the engram root, regenerated from each
+research run, plus an append-only refresh log. A hand-written operator log
+block inside the dossier is carried verbatim across every regeneration; a
+malformed block sends the fresh render to a side file rather than clobbering
+the notes. Demoted names are archived, never deleted.
 
-Demoted-to-D picks are moved to `vault/_archive/` — never deleted, so
-historical context survives in git for post-mortem.
-
-Naming: "vault" is intentionally Obsidian-friendly; you can open `vault/` as
-an Obsidian vault if you want the graph view. Kestrel doesn't depend on it.
+Today the memory is write-only with respect to the analysis stages: no stage
+reads it back yet, and only the tier-history tags are carried forward into
+the next regeneration. The dossiers themselves, tied to real names, are not
+published.
 """

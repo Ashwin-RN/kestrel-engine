@@ -1,25 +1,37 @@
 """
-Live tick watcher loop — drives the anti-falling-knife state machine.
+Live tick watcher loop: drives the entry machines and places orders through Talon.
 
 Subscribes via KiteTicker to:
-  - the instrument tokens of the latest synth's ranked picks
-  - NIFTY 50 (for the broad-market `index_above_vwap` confluence filter)
+  - the instrument tokens of today's armed picks and every held position
+  - NIFTY 50 (the broad-market confluence leg of the reversal gate)
 
 Per-symbol pipeline on each tick:
 
-  tick → PerSymbolState (ltp, cum vol)
-       → TickBarAggregator (emits 15m/1H bars)
-       → StateMachine.on_tick (invalidation guard)
-       → StateMachine.on_15m_bar_close (entry-gate evaluation)
+  tick -> PerSymbolState (ltp, cum vol)
+       -> TickBarAggregator (emits 15m / 1H bars)
+       -> StateMachine.on_tick (invalidation guard)
+       -> StateMachine.on_15m_bar_close (entry-gate evaluation, on bar close)
+       -> Fulcrum V2 CampaignMachine (live or shadow per entry profile)
 
-State transitions are logged to console and persisted per day. When a
-machine reaches its confirmation state the loop places the entry through
-Talon (paper by default). Exits are described at the exit-side hook below.
+When a machine confirms, the entry goes through ONE chokepoint,
+`_try_place_entry`, which applies the front gates (entry cutoff, news blackout,
+the plan's entry band) and then Talon's fire-time gate chain. Every refusal is
+recorded as a `fire_gate_block` row in the day's decision log, and every armed
+name that does not fire records why not, so a quiet day is explainable.
 
-Usage:
-    python -m watcher.loop
-    python -m watcher.loop --status
-    python -m watcher.loop --synth <path>
+Exit posture: the loss side is alert-only. The stop check and the time
+checkpoints write alert rows and the operator sells by hand. Apex owns the
+take-profit exit and can be armed to sell; reaching the plan target is only a
+mark that hands the name to Apex. Macro blocks new entries and never
+liquidates.
+
+Public edition: this is an excerpt of a much larger module. Kept: the startup
+order in `run`, the entry chokepoint with its ordered refusal chain, the
+decision telemetry, the fail-closed flag reader, the alert-only stop check, the
+Fulcrum V2 live/shadow routing, the stall watchdog and the tick handler.
+Helpers that are not published are reduced to a call and a one-line comment.
+Every tuned value (stop threshold, pricing tolerances, completion bounds,
+lookbacks, the arming settings) is withheld as `None`.
 """
 
 from __future__ import annotations
@@ -29,20 +41,34 @@ import json
 import logging
 import os
 import sys
+import threading
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from core import config
 from core.time import IST, now
-from watcher.bars import IndexVwapTracker, TickBarAggregator
-from watcher.state import (
-    ActivePick,
-    PerSymbolState,
-    WATCHER_DIR,
-    load_active_picks,
+from watcher.bars import IndexTrendTracker, IndexVwapTracker, TickBarAggregator
+from watcher.blackout import (
+    BLACKOUT_UNKNOWN,
+    detect_news_blackout as _detect_news_blackout,
+    effective_blackout,
+    override_applies,
+    parse_blackout_overrides,
 )
-from watcher.state_machine import Bar, State, StateMachine
+from watcher.gate_config import GateConfig
+from watcher.state import ActivePick, PerSymbolState, load_active_picks
+from watcher.state_machine import (
+    Bar,
+    Stage3Config,
+    State,
+    StateMachine,
+    high_tier_profile_eligible,
+    news_blackout_active,
+)
+
+if TYPE_CHECKING:
+    from watcher.session import WatcherSession  # not published in the public edition
 
 log = logging.getLogger("fulcrum.loop")
 logging.basicConfig(
@@ -53,111 +79,215 @@ logging.basicConfig(
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
-# NIFTY 50 NSE_INDICES instrument token — well-known constant on Kite.
-# Fallback if symbol resolution fails (indices are on a different exchange).
+# Exit code that signals a RECOVERABLE feed stall to the restart supervisor. The
+# supervisor restarts only on this code; 0 = clean market close, any other non-zero
+# = deterministic failure (no restart loop).
+STALL_EXIT_CODE = 75
+
+# KiteTicker auto-reconnect (300 is the library's hard maximum).
+RECONNECT_MAX_TRIES = 300
+RECONNECT_MAX_DELAY = 60
+
+# NIFTY 50 NSE_INDICES instrument token on Kite, used if name resolution fails.
 NIFTY_50_FALLBACK_TOKEN = 256265
 
-# The macro severity cutoff that halts new entries is a tuned risk-posture
-# threshold withheld from the public edition. Macro never liquidates: at any
-# severity the gate blocks entries and nothing else.
-_MACRO_HALT_SEVERITY: Optional[int] = None
+# --- Withheld values ---
+STOP_LOSS_THRESHOLD_PCT: Optional[float] = None    # withheld from the public edition
+ENTRY_FLOOR_TOL_PCT: Optional[float] = None        # withheld from the public edition
+ENTRY_SLIP_PCT: Optional[float] = None             # withheld from the public edition
+COMPLETION_PRICE_BAND_PCT: Optional[float] = None  # withheld from the public edition
+COMPLETION_MAX_ADD_FRAC: Optional[float] = None    # withheld from the public edition
+_TECHNICALS_LOOKBACK_DAYS: Optional[int] = None    # withheld from the public edition
+# Arming settings. Their names are withheld; with them unset every one of these
+# resolves to SHADOW through the fail-closed reader below.
+_APEX_AUTOSELL_SETTING: Optional[str] = None       # withheld from the public edition
+_FV2_MASTER_MODE_SETTING: Optional[str] = None     # withheld from the public edition
+_FV2_LIVE_PROFILES_SETTING: Optional[str] = None   # withheld from the public edition
 
-# The news-blackout window around a result filing and the candle lookback the
-# technicals refresh anchors on are tuned and withheld from the public edition.
-# With either left at None the corresponding step is skipped and says so.
-_NEWS_BLACKOUT_WINDOW_DAYS: Optional[int] = None
-_TECHNICALS_LOOKBACK_DAYS: Optional[int] = None
+_LOGGED_ONCE: set[str] = set()
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────
+def _log_once(key: str, msg: str, *args) -> None:
+    """INFO once per process for a withheld-value notice (never once per tick)."""
+    if key in _LOGGED_ONCE:
+        return
+    _LOGGED_ONCE.add(key)
+    log.info(msg, *args)
+
+
+def _flag_armed(raw: Optional[str]) -> bool:
+    """THE fail-closed arming reader. ONLY 1 / true / yes / on arm a live
+    behaviour; unset, blank, "shadow", "0" or any typo stays SHADOW. (An older
+    `not in (0/false/no/off)` spelling armed live selling on the literal
+    "shadow"; an allowlist cannot.)"""
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _in_market_hours() -> bool:
     t = now().astimezone(IST).time()
     return MARKET_OPEN <= t <= MARKET_CLOSE
 
 
-def _fetch_circuit_limits(broker, symbols: list[str]) -> dict[str, dict]:
-    """Returns {symbol: {lower, upper}} from Kite's quote endpoint.
-
-    Lower circuit is a hard stop — if today's LTP touches it, liquidity dies
-    and we cannot exit. The state machine invalidates on that event.
-    """
-    out: dict[str, dict] = {}
-    try:
-        keys = [f"NSE:{s}" for s in symbols]
-        q = broker._kite.quote(keys)  # noqa: SLF001
-        for s in symbols:
-            data = q.get(f"NSE:{s}", {}) or {}
-            out[s] = {
-                "lower": data.get("lower_circuit_limit"),
-                "upper": data.get("upper_circuit_limit"),
-            }
-    except Exception as e:
-        log.warning("circuit limit fetch failed: %s", e)
-    return out
+# Serialises the alerts-JSONL append: it is called from the reconcile thread and
+# the tick thread, and an interleaved append could tear a line that the
+# catastrophic-check reader would then skip (a missed loss signal).
+_ALERT_WRITE_LOCK = threading.Lock()
 
 
-def _detect_news_blackout(broker, symbol: str, window_days: int) -> Optional[date]:
-    """News-blackout window: returns the blackout-until date if a
-    `financial_result` filing landed inside the last `window_days` days.
-
-    The state machine refuses to enter IN_ZONE while a blackout is active: a
-    fundamentals shock routinely invalidates every technical level for a while
-    after the filing. The production version fails closed (an unreadable feed
-    blocks the name); this earlier snapshot returns None on a fetch failure.
-    """
-    try:
-        from data import filings as filings_mod
-        items = filings_mod.FilingFetcher().get_announcements(
-            symbol, days_back=window_days + 2, max_items=20,
-        )
-    except Exception as e:
-        log.warning("[%s] filings fetch for blackout check failed: %s", symbol, e)
-        return None
-
-    today = date.today()
-    cutoff = today - timedelta(days=window_days)
-    blackout_until = None
-    for f in items:
-        if f.tag != "financial_result":
-            continue
-        try:
-            filing_date = date.fromisoformat(f.date[:10])
-        except ValueError:
-            continue
-        if filing_date >= cutoff:
-            candidate = filing_date + timedelta(days=window_days)
-            if blackout_until is None or candidate > blackout_until:
-                blackout_until = candidate
-    return blackout_until
+def _write_alert(payload: dict) -> Path:
+    """Append a one-line JSON alert to the day's alerts file under the state dir."""
+    alerts_dir = config.STATE_DIR / "alerts"
+    alerts_dir.mkdir(parents=True, exist_ok=True)
+    path = alerts_dir / f"{date.today().isoformat()}.jsonl"
+    line = json.dumps(payload, default=str) + "\n"
+    with _ALERT_WRITE_LOCK, path.open("a", encoding="utf-8") as f:
+        f.write(line)
+    return path
 
 
-def _refresh_technicals(broker, symbol: str, lookback_days: Optional[int]) -> Optional[dict]:
-    """Pull fresh candles and recompute technicals. Buy zones must reflect
-    today's reality, not the synth-time snapshot."""
-    from strategies.fallen_angel.technicals import compute_technicals
-    if lookback_days is None:
-        log.warning("[%s] technicals lookback withheld from the public edition; refresh skipped", symbol)
-        return None
-    try:
-        inst = broker.instrument(symbol)
-        today = date.today()
-        candles = broker.historical_candles(
-            inst, today - timedelta(days=lookback_days), today, interval="day",
-        )
-        if candles.empty:
-            log.warning("[%s] empty candles on refresh", symbol)
-            return None
-        last = float(candles["close"].iloc[-1])
-        return compute_technicals(candles, price=last)
-    except Exception as e:
-        log.error("[%s] technicals refresh failed: %s", symbol, e)
-        return None
+# --- Liveness: market-close stop, heartbeat, stall watchdog ---
 
+def _start_market_close_watchdog(kws, deliberate_close: dict, *,
+                                 close_at: time = MARKET_CLOSE, grace_min: int = 1) -> None:
+    """Daemon that stops the KiteTicker `grace_min` minutes after the close, so an
+    in-progress 15m bar can flush. Marks the stop as deliberate so `run` returns 0
+    (a clean close) rather than the stall code."""
+    import time as _time
+
+    def _run():
+        while True:
+            now_ist = now().astimezone(IST)
+            target = now_ist.replace(hour=close_at.hour, minute=close_at.minute,
+                                     second=0, microsecond=0) + timedelta(minutes=grace_min)
+            if now_ist >= target:
+                log.info("market-close watchdog: stopping ticker")
+                deliberate_close["value"] = True
+                try:
+                    kws.stop()
+                except Exception as e:                                  # noqa: BLE001
+                    log.warning("market-close watchdog: kws.stop() failed: %s", e)
+                return
+            _time.sleep(min((target - now_ist).total_seconds(), 60))
+
+    threading.Thread(target=_run, name="market-close-watchdog", daemon=True).start()
+
+
+def _start_heartbeat(tick_stats: dict, sms: dict, *, interval_sec: int = 60) -> None:
+    """Daemon that logs a liveness line every `interval_sec`: total ticks, the delta,
+    the age of the last tick, and each machine's state. A frozen count or a growing
+    age means the feed has stalled while the process is alive. (The private edition
+    also folds in per-name why-not summaries and V2 campaign lines.)"""
+    import time as _time
+
+    def _run():
+        last = 0
+        while True:
+            _time.sleep(interval_sec)
+            count = tick_stats.get("count", 0)
+            delta, last = count - last, count
+            lm = tick_stats.get("last_monotonic")
+            age = f"{_time.monotonic() - lm:.0f}s ago" if lm else "none yet"
+            states = " ".join(f"{s}={m.state.value}" for s, m in list(sms.items()))
+            (log.info if delta > 0 else log.warning)(
+                "HEARTBEAT alive | ticks=%d (+%d/%ds) | last tick %s | %s",
+                count, delta, interval_sec, age, states)
+
+    threading.Thread(target=_run, name="watcher-heartbeat", daemon=True).start()
+
+
+def _stall_should_escalate(tick_stats: dict, start_monotonic: float,
+                           now_monotonic: float, *, stall_sec: float,
+                           in_market_hours: bool) -> bool:
+    """Pure stall decision: inside market hours AND no tick for longer than
+    `stall_sec`. The baseline is the last tick, or the connect-start time when no
+    tick has arrived yet (a connection that never produces a first tick still
+    escalates). Outside market hours there are legitimately no ticks."""
+    if not in_market_hours:
+        return False
+    lm = tick_stats.get("last_monotonic")
+    baseline = lm if lm is not None else start_monotonic
+    return (now_monotonic - baseline) > stall_sec
+
+
+def _start_stall_watchdog(tick_stats: dict, sms: dict, *, stall_sec: float = 180.0,
+                          check_every: int = 30, exit_fn=os._exit) -> None:
+    """Daemon that hard-exits the process on a sustained feed stall.
+
+    The ticker library reconnects on a DETECTED drop, but two failure modes leave
+    the process alive with zero ticks forever: a silent half-open connection the
+    library never notices, and reconnect exhaustion that blocks `connect()`
+    indefinitely. This is the backstop: no tick for `stall_sec` during market
+    hours writes an alert row and exits STALL_EXIT_CODE so the supervisor
+    restarts a clean process (the reactor is not restartable in-process).
+    `exit_fn` is injectable for tests."""
+    import time as _time
+    start = _time.monotonic()
+
+    def _run():
+        while True:
+            _time.sleep(check_every)
+            if not _stall_should_escalate(tick_stats, start, _time.monotonic(),
+                                          stall_sec=stall_sec,
+                                          in_market_hours=_in_market_hours()):
+                continue
+            lm = tick_stats.get("last_monotonic")
+            age = _time.monotonic() - (lm if lm is not None else start)
+            log.error("STALL: no ticks for %.0fs during market hours (threshold %ds); "
+                      "exiting %d for a supervisor restart", age, stall_sec, STALL_EXIT_CODE)
+            try:
+                _write_alert({
+                    "kind": "watcher_stall_restart",
+                    "stall_age_sec": round(age, 1), "threshold_sec": stall_sec,
+                    "ticks_total": tick_stats.get("count", 0),
+                    "timestamp": datetime.now().isoformat(),
+                    "action": f"EXIT_{STALL_EXIT_CODE}_FOR_SUPERVISOR_RESTART",
+                })
+            except Exception:                                           # noqa: BLE001
+                pass
+            exit_fn(STALL_EXIT_CODE)
+
+    threading.Thread(target=_run, name="watcher-stall-watchdog", daemon=True).start()
+    log.info("stall watchdog armed (escalate after %ds of no ticks in market hours)",
+             stall_sec)
+
+
+def _start_reconcile_daemon(broker, *, interval_sec: int = 30, on_fill=None) -> None:
+    """Daemon (live mode) that books broker fills of PENDING orders to the position
+    book and then reloads the in-memory exit snapshot EVERY cycle, so a direct book
+    edit made by hand is picked up within one interval. Each stage is isolated so a
+    reconcile failure never costs the snapshot refresh. (The private edition also
+    re-prices resting exit orders and un-latches broker-rejected exits here.)"""
+    if not config.LIVE_TRADING_ENABLED:
+        log.info("reconcile daemon not started (paper mode: fills are immediate)")
+        return
+    import time as _time
+    from talon.orders import reconcile_pending
+
+    def _run():
+        while True:
+            _time.sleep(interval_sec)
+            if not _in_market_hours():
+                continue
+            try:
+                summary = reconcile_pending(broker)
+                if summary.get("filled"):
+                    log.warning("reconcile: %d fill(s) processed | %s",
+                                summary["filled"], summary)
+            except Exception as e:                                      # noqa: BLE001
+                log.exception("reconcile daemon iteration failed: %s", e)
+            if on_fill is not None:
+                try:
+                    on_fill()
+                except Exception as e:                                  # noqa: BLE001
+                    log.exception("reconcile position refresh failed: %s", e)
+
+    threading.Thread(target=_run, name="watcher-reconcile", daemon=True).start()
+    log.info("reconcile daemon armed (every %ds, live mode)", interval_sec)
+
+
+# --- Startup helpers ---
 
 def _resolve_nifty_token(broker) -> int:
-    """Try to resolve NIFTY 50 via the broker, fall back to the well-known
-    instrument_token if resolution fails."""
     try:
         return broker.resolve_token("NIFTY 50")
     except Exception as e:
@@ -166,33 +296,323 @@ def _resolve_nifty_token(broker) -> int:
         return NIFTY_50_FALLBACK_TOKEN
 
 
-def _catastrophic_move_threshold_pct() -> Optional[float]:
-    """Single-day catastrophic-move alert threshold, compared against the move
-    from the previous-day close. The production default and its env-var override
-    are risk-management settings withheld from the public edition; this returns
-    None, which disables the alert in this edition.
-    """
-    return None
+def _fetch_circuit_limits(broker, symbols: list[str]) -> dict[str, dict]:
+    """Returns {symbol: {lower, upper}} from Kite's quote endpoint.
+
+    The lower circuit is a hard stop: if today's LTP touches it, liquidity dies and
+    we cannot exit, so the state machine invalidates on that event. An empty roster
+    returns {} without calling Kite (an empty quote request comes back as an
+    untyped error)."""
+    out: dict[str, dict] = {}
+    if not symbols:
+        return out
+    # Resolve each pick to its real Kite tradingsymbol (e.g. EXMPL -> EXMPL-BE for a
+    # trade-to-trade name). The quote endpoint keys on the listed symbol, so a bare
+    # base symbol returns nothing and the lower-circuit guard silently goes blind.
+    # Output stays keyed by the base symbol.
+    ts_by_sym: dict[str, str] = {}
+    for s in symbols:
+        try:
+            ts_by_sym[s] = broker.instrument(s).symbol
+        except Exception as e:
+            log.warning("[%s] circuit-limit symbol resolve failed: %s", s, e)
+            ts_by_sym[s] = s
+    try:
+        q = broker._kite.quote([f"NSE:{ts}" for ts in ts_by_sym.values()])  # noqa: SLF001
+        for s, ts in ts_by_sym.items():
+            data = q.get(f"NSE:{ts}", {}) or {}
+            out[s] = {"lower": data.get("lower_circuit_limit"),
+                      "upper": data.get("upper_circuit_limit")}
+    except Exception as e:
+        log.warning("circuit limit fetch failed: %s", e)
+    return out
 
 
-def _entry_drawdown_alert_threshold_pct() -> Optional[float]:
-    """Cumulative-from-entry drawdown alert threshold, compared against the
-    position's average entry price (alert-only, no auto-exit). The production
-    default and its env-var override are withheld from the public edition; this
-    returns None, which disables the alert in this edition.
-    """
-    return None
+def _refresh_technicals(broker, symbol: str) -> Optional[dict]:
+    """Pull fresh daily candles and recompute technicals: buy zones must reflect
+    today's reality, not the synth-time snapshot."""
+    from strategies.fallen_angel.technicals import compute_technicals
+    if _TECHNICALS_LOOKBACK_DAYS is None:
+        log.warning("[%s] technicals lookback withheld from the public edition; "
+                    "refresh skipped", symbol)
+        return None
+    try:
+        inst = broker.instrument(symbol)
+        today = date.today()
+        candles = broker.historical_candles(
+            inst, today - timedelta(days=_TECHNICALS_LOOKBACK_DAYS), today, interval="day")
+        if candles.empty:
+            log.warning("[%s] empty candles on refresh", symbol)
+            return None
+        return compute_technicals(candles, price=float(candles["close"].iloc[-1]))
+    except Exception as e:
+        log.error("[%s] technicals refresh failed: %s", symbol, e)
+        return None
 
 
-def _write_alert(payload: dict) -> Path:
-    """Append a one-line JSON alert to state/alerts/{date}.jsonl."""
-    alerts_dir = Path("state") / "alerts"
-    alerts_dir.mkdir(parents=True, exist_ok=True)
-    path = alerts_dir / f"{date.today().isoformat()}.jsonl"
+def _gate_param(gate_config, gate: str, key: str):
+    """Read one resolved parameter off the GateConfig; None when absent (a withheld
+    value in the public edition)."""
+    try:
+        return (getattr(gate_config, gate).params or {}).get(key)
+    except Exception:                                                   # noqa: BLE001
+        return None
+
+
+def _evaluate_apex(broker, macro_severity: int, **kwargs) -> dict:
+    """Run every open position through the Apex take-profit machine
+    (apex.ApexStateMachine) on fresh daily candles and return the verdicts plus the
+    per-tick floor watch. Body not published in the public edition."""
+    raise NotImplementedError("Apex evaluation helper not published in the public edition")
+
+
+def _construct_fv2_session(session, **kwargs) -> None:
+    """Build one watcher.campaign.CampaignMachine per pick, restoring cross-session
+    campaigns from the campaign store. Body not published in the public edition."""
+    raise NotImplementedError("Fulcrum V2 construction helper not published in the public edition")
+
+
+# --- Decision telemetry: every armed name that does not fire says why ---
+# The state machine builds `awaiting_reversal` (choch / volume surge / index proxies)
+# on every EXHAUSTING bar that does not fire, and `idle_block` on every IDLE bar. We
+# persist them (one JSONL row per armed name per bar) from the SAME vector, with no
+# second derivation. Pure observability: never changes a transition, order or gate.
+DECISIONS_DIR = config.STATE_DIR / "decisions"
+DECISION_LOG_SCHEMA_VERSION = 3
+
+
+def _decision_log_enabled() -> bool:
+    """The private edition reads an operator switch here (default ON)."""
+    return True
+
+
+def _vol_ratio_and_threshold(av: dict) -> tuple[Optional[float], Optional[float]]:
+    """(volume / SMA-20 ratio, the multiple it was judged against), derived from the
+    stored surge detail; detect_volume_surge is NOT re-run."""
+    sd = av.get("surge_detail") or {}
+    multiple, threshold, bar_volume = sd.get("multiple"), sd.get("threshold"), sd.get("bar_volume")
+    vol_ratio: Optional[float] = None
+    if bar_volume is not None and threshold and multiple:
+        sma = threshold / multiple
+        if sma:
+            vol_ratio = bar_volume / sma
+    return vol_ratio, (float(multiple) if multiple is not None else None)
+
+
+def _stage3_binding(av: dict) -> tuple[Optional[str], Optional[str]]:
+    """(binding_gate, sole_blocker) among the three Stage-3 legs in fire order
+    choch -> volume -> index: binding = the first failing leg, sole = the only one."""
+    legs = (("choch", bool(av.get("choch"))), ("volume", bool(av.get("volume_surge"))),
+            ("index", bool(av.get("index_ok"))))
+    failing = [name for name, ok in legs if not ok]
+    return (failing[0] if failing else None), (failing[0] if len(failing) == 1 else None)
+
+
+def _why_not_row(sym: str, state: str, av: dict, *, ts: str,
+                 ltp: Optional[float], bar=None) -> dict:
+    """The structured decision row for one armed name on one bar: the gate vector,
+    the binding and sole-blocking leg, the raw index reads and the bar, so the
+    offline gate ledger can recompute counterfactuals without re-running the loop."""
+    vol_ratio, vol_threshold = _vol_ratio_and_threshold(av)
+    binding_gate, sole_blocker = _stage3_binding(av)
+    row = {
+        "schema_version": DECISION_LOG_SCHEMA_VERSION,
+        "ts": ts, "sym": sym, "arm_id": av.get("arm_id"), "state": state,
+        "choch_ok": bool(av.get("choch")),
+        "vol_ratio": round(vol_ratio, 4) if vol_ratio is not None else None,
+        "vol_threshold": vol_threshold,          # the EFFECTIVE multiple for this pick
+        "vol_surge_window": av.get("vol_surge_window"),
+        "index_above_vwap": av.get("index_above_vwap"),
+        "index_trend_up": av.get("index_trend_up"),
+        "index_ok": av.get("index_ok"),
+        "high_tier_profile": bool(av.get("high_tier_profile")),
+        "binding_gate": binding_gate,
+        "sole_blocker": sole_blocker,
+        "nifty_regime_ok": av.get("nifty_regime_ok"),       # SHADOW
+        "nifty_ltp": av.get("nifty_ltp"), "nifty_vwap": av.get("nifty_vwap"),
+        "nifty_ema": av.get("nifty_ema"), "nifty_sma_200": av.get("nifty_sma_200"),
+        "bar_volume": av.get("bar_volume"), "sma_20_vol": av.get("sma_20_vol"),
+        "vol_surge_within_window": av.get("vol_surge_within_window"),
+        "trend_ok_at_entry": av.get("trend_ok_at_entry"),   # False => the trend veto would have blocked
+        "swing_high_tested": av.get("swing_high_tested"),
+        "swing_window_used": av.get("swing_window_used"),
+        "ltp": ltp,
+    }
+    if bar is not None:
+        row.update(bar_open=float(bar.open), bar_high=float(bar.high), bar_low=float(bar.low))
+    return row
+
+
+def _idle_block_row(sym: str, ib: dict, *, ts: str, ltp: Optional[float]) -> dict:
+    """The row for an armed name held at IDLE while IN a buy zone: isolates the
+    per-stock trend gate (or macro, or a blackout) as the blocker."""
+    trend = ib.get("trend") or {}
+    return {
+        "schema_version": DECISION_LOG_SCHEMA_VERSION, "ts": ts, "sym": sym,
+        "state": "IDLE",
+        "macro_block": bool(ib.get("macro_block")),
+        "news_blackout_block": bool(ib.get("news_blackout_block")),
+        "trend_ok": bool(ib.get("trend_ok")),
+        "in_zone": bool(ib.get("in_zone")),
+        "trend_sole_blocker": bool(ib.get("trend_sole_blocker")),
+        "ema_50": trend.get("ema_50"), "ema_50_slope": trend.get("ema_50_slope"),
+        "ltp": ltp,
+    }
+
+
+def _append_decision_row(row: dict) -> Path:
+    DECISIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = DECISIONS_DIR / f"{date.today().isoformat()}.jsonl"
     with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, default=str) + "\n")
+        f.write(json.dumps(row, default=str) + "\n")
     return path
 
+
+def persist_why_not(sym: str, sm: StateMachine, bar: Bar) -> None:
+    """Append one 'why-not-fired' row, keyed by state:
+
+      EXHAUSTING : the reversal-gate vector. `state == EXHAUSTING` after the bar is
+        an exact freshness signal (a fire would have moved it to
+        REVERSAL_CONFIRMED), so the stored vector is always this bar's.
+      IDLE       : only when price is IN a buy zone, so a trend-gate block becomes
+        countable. A name far from any zone is not blocked, just not ready.
+
+    FULLY fail-safe: telemetry can never propagate into the bar handler."""
+    try:
+        if not _decision_log_enabled():
+            return
+        ct = getattr(bar, "close_time", None)
+        ts = ct.isoformat() if ct is not None else now().astimezone(IST).isoformat()
+        if sm.state == State.EXHAUSTING:
+            av = sm.extras.get("awaiting_reversal")
+            if not av:
+                return
+            row = _why_not_row(sym, sm.state.value, av, ts=ts, ltp=float(bar.close), bar=bar)
+        elif sm.state == State.IDLE:
+            ib = sm.extras.get("idle_block")
+            if not ib or not ib.get("in_zone"):
+                return
+            row = _idle_block_row(sym, ib, ts=ts, ltp=float(bar.close))
+        else:
+            return
+        row["gate_cfg_hash"] = getattr(sm, "gate_cfg_hash", None)
+        _append_decision_row(row)
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("[%s] decision-log persist failed (non-fatal): %s", sym, e)
+
+
+def persist_session_gate_config(gate_config) -> None:
+    """One session header row carrying the fully resolved GateConfig: the anchor
+    for every gate_cfg_hash stamped this session, so a fired trade carries the exact
+    gate configuration that was live. Fail-safe."""
+    try:
+        if not _decision_log_enabled() or gate_config is None:
+            return
+        _append_decision_row({
+            "schema_version": DECISION_LOG_SCHEMA_VERSION,
+            "type": "session_gate_config",
+            "ts": now().astimezone(IST).isoformat(),
+            "gate_cfg_hash": gate_config.config_hash(),
+            **gate_config.as_provenance_dict(),
+        })
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("session gate-config stamp failed (non-fatal): %s", e)
+
+
+def _persist_fire_gate_block(sym: str, sm, exc: Optional[Exception] = None, *,
+                             gate: Optional[str] = None,
+                             detail: Optional[str] = None) -> Optional[str]:
+    """Append one `fire_gate_block` row when an entry is refused at placement:
+    a Talon fire-time exception (pass `exc`; a typed refusal names its own gate)
+    or a chokepoint policy refusal (pass `gate` + `detail`). Makes every block
+    countable instead of a log line. Returns the gate name it filed. Fail-safe."""
+    try:
+        if gate is None:
+            gate = getattr(exc, "gate", None)
+        if gate is None:
+            from talon.safety import MacroVetoAtFire
+            # "unknown", never a real gate name: a wrong label reads exactly like
+            # a real count.
+            gate = "macro_veto" if isinstance(exc, MacroVetoAtFire) else "unknown"
+        if _decision_log_enabled():
+            _append_decision_row({
+                "schema_version": DECISION_LOG_SCHEMA_VERSION,
+                "type": "fire_gate_block",
+                "ts": now().astimezone(IST).isoformat(),
+                "sym": sym, "gate": gate,
+                "detail": detail if detail is not None else str(exc),
+                "gate_cfg_hash": getattr(sm, "gate_cfg_hash", None),
+            })
+        return gate
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("[%s] fire_gate_block row failed (non-fatal): %s", sym, e)
+        return gate
+
+
+# --- Entry pricing and the completion re-check ---
+
+def _slip_limit(bar_close: float, slip_pct: float, buy_below: Optional[float], *,
+                tick: Optional[float], symbol: str = "?") -> float:
+    """Marketable-limit price: bar_close x (1 + slip_pct/100), CLAMPED to the
+    band ceiling, and only THEN snapped DOWN onto the instrument's own tick.
+    Clamp-then-snap is the point: snapping first and clamping second can send an
+    off-grid ceiling as the limit, which the exchange rejects. The result can never
+    exceed the ceiling. No usable tick means no slip (the traded close is on its
+    own grid by construction)."""
+    from core import ticks
+    close = float(bar_close)
+    px = close * (1.0 + float(slip_pct) / 100.0)
+    if buy_below is not None:
+        px = min(px, float(buy_below))
+    if tick is not None:
+        try:
+            return ticks.snap_down(px, tick)
+        except ValueError as e:
+            log.error("[%s] entry slip: tick or price unusable (%s); using the bar close",
+                      symbol, e)
+    return close
+
+
+# `None` is meaningful for `position` (the position closed intraday, which refuses a
+# completion), so "the caller did not thread the book at all" needs its own value.
+_POSITION_NOT_THREADED = object()
+
+
+def _completion_fire_gate(sym: str, *, qty: int, limit_price: float,
+                          position) -> Optional[str]:
+    """Fire-time re-assertion of the completion gate for an add that finishes an
+    under-deployed position. Returns None when the add may proceed, else the refusal
+    detail. The plan build checked it before the open; the book can move all day
+    (a take-profit partial shrinks the invested base), so it is re-checked against
+    the book AS IT IS NOW:
+
+      a. no OPEN position -> refuse (a completion of a closed name is a fresh entry
+         wearing the wrong purpose);
+      b. the price actually being SENT is outside the band around the average cost
+         -> refuse;
+      c. the add's notional exceeds the allowed multiple of what is still invested
+         -> refuse.
+    """
+    if position is None:
+        return f"no OPEN position for {sym} at fire time: a completion may only finish a live position"
+    if COMPLETION_PRICE_BAND_PCT is None or COMPLETION_MAX_ADD_FRAC is None:
+        return "completion bounds withheld from the public edition: refused fail-closed"
+    try:
+        avg = float(getattr(position, "avg_entry_price", None) or 0.0)
+        invested = float(getattr(position, "invested_inr", None) or 0.0)
+    except (TypeError, ValueError):
+        avg, invested = 0.0, 0.0
+    if avg <= 0 or invested <= 0:
+        return f"{sym} carries no usable cost basis at fire time: refused fail-closed"
+    drift_pct = (limit_price / avg - 1.0) * 100.0
+    if abs(drift_pct) > COMPLETION_PRICE_BAND_PCT:
+        return f"limit {limit_price:,.2f} is {drift_pct:+.1f}% vs avg {avg:,.2f}, outside the band"
+    if qty * limit_price > COMPLETION_MAX_ADD_FRAC * invested:
+        return f"add of {qty} sh x {limit_price:,.2f} exceeds the max-add multiple of the invested base"
+    return None
+
+
+# --- The single entry chokepoint ---
 
 def _try_place_entry(
     *,
@@ -204,170 +624,410 @@ def _try_place_entry(
     tranche_number: int,
     purpose: str,
     placed_tranches: dict[str, set[int]],
-    paused_symbols: Optional[set[str]] = None,
-) -> None:
-    """Compute tranche size, place limit-buy, record in placed_tranches set.
+    quantity: Optional[int] = None,
+    position=_POSITION_NOT_THREADED,
+):
+    """Place one entry, or refuse it with a recorded reason.
 
-    Honours core.config.LIVE_TRADING_ENABLED via the broker layer. Paper mode
-    auto-fills at limit price; live mode leaves PENDING for reconcile.
+    EVERY entry passes through here: a plan-funded V1 fire, each Fulcrum V2
+    campaign leg (explicit `quantity`, routed by `_fv2_route_live_fire`), and a
+    held-name add. The ordered refusal chain:
+
+      1. entry cutoff     : no new entry into the close (exits never route here)
+      2. news blackout    : the last belt behind both machines' arming refusals
+      3. band ceiling     : limit above the plan's entry-range ceiling
+      4. band floor       : limit below the plan's entry-range floor
+      5. completion gate  : an add finishing a position, re-checked on the live book
+      6. Talon gate chain : inside talon.orders.place_entry, in order: the two-list
+                            symbol check, the duplicate check against the ledger
+                            and broker truth, the macro re-check, the sector cap,
+                            the partial-funding clamp, the fire-time cash gate, the
+                            minimum-fill viability check, the tick snap, the ledger
+                            append, then the broker call.
+
+    Every refusal writes a `fire_gate_block` row. A refusal does NOT lock the
+    tranche (a later bar may pass) except where retrying is pointless (qty <= 0,
+    a confirmed duplicate). Returns the persisted order record, else None.
     """
-    if paused_symbols is not None and sym in paused_symbols:
-        log.warning("[%s] T%d skip: name paused (catastrophic intraday move)",
-                    sym, tranche_number)
-        return
-    from talon.orders import compute_tranche_qty, place_entry
+    bar_close_raw = float(limit_price)
 
-    capital = pick.capital_inr or config.FALLBACK_CAPITAL_INR
-    alloc = float(pick.suggested_allocation_pct or 0.0)
-    tranche_fraction = sm.tranche_split[tranche_number - 1]
-    if alloc <= 0 or tranche_fraction <= 0:
-        log.warning("[%s] T%d skip: alloc=%s tranche_fraction=%s",
-                    sym, tranche_number, alloc, tranche_fraction)
-        return
+    # --- 1. Entry cutoff ---
+    cutoff = getattr(sm, "entry_cutoff", None)
+    if cutoff is None:
+        _log_once("entry_cutoff", "entry cutoff withheld from the public edition; "
+                  "cutoff check skipped")
+    else:
+        t_ist = now().astimezone(IST).time()
+        if t_ist >= cutoff:
+            log.warning("[%s] T%d entry SUPPRESSED: %s IST is at/after the entry cutoff",
+                        sym, tranche_number, t_ist.strftime("%H:%M:%S"))
+            _persist_fire_gate_block(sym, sm, gate="entry_cutoff",
+                                     detail=f"{t_ist.isoformat(timespec='seconds')} >= cutoff")
+            return None
 
-    qty = compute_tranche_qty(
-        capital_inr=capital, allocation_pct=alloc,
-        tranche_fraction=tranche_fraction, limit_price=limit_price,
-    )
-    if qty <= 0:
-        log.warning("[%s] T%d qty=0 (capital=%.0f alloc=%.0f%% frac=%.0f%% px=%.2f) — skipping",
-                    sym, tranche_number, capital, alloc, tranche_fraction * 100, limit_price)
-        placed_tranches.setdefault(sym, set()).add(tranche_number)  # don't keep retrying
-        return
+    # --- 2. News blackout (fails safe on a non-date field) ---
+    bo_until = getattr(sm, "news_blackout_until", None)
+    bo_reason = getattr(sm, "news_blackout_reason", None) or "unspecified"
+    if news_blackout_active(bo_until, now().astimezone(IST).date()):
+        log.warning("[%s] T%d entry SUPPRESSED: NEWS BLACKOUT active until %s (%s)",
+                    sym, tranche_number, bo_until, bo_reason)
+        _persist_fire_gate_block(sym, sm, gate="news_blackout",
+                                 detail=f"blackout until {bo_until} reason={bo_reason}")
+        return None
 
-    log.warning("[%s] PLACING T%d limit-buy qty=%d @ ₹%.2f (capital=%.0f alloc=%.0f%% frac=%.0f%%)",
-                sym, tranche_number, qty, limit_price, capital, alloc, tranche_fraction * 100)
+    # --- 3. Band ceiling ---
     try:
-        place_entry(
+        bbp = float(pick.buy_below_price) if pick.buy_below_price is not None else None
+    except (TypeError, ValueError):
+        bbp = None
+    if bbp is not None and limit_price > bbp:
+        log.warning("[%s] T%d skip: limit %.2f > band ceiling %.2f", sym, tranche_number,
+                    limit_price, bbp)
+        _persist_fire_gate_block(sym, sm, gate="buy_below_ceiling",
+                                 detail=f"limit={limit_price:.2f} > buy_below={bbp:.2f}")
+        return None
+
+    # --- 4. Band floor (a below-band fire collapses the entry-to-stop geometry) ---
+    try:
+        floor = float(pick.entry_floor_price) if pick.entry_floor_price is not None else None
+    except (TypeError, ValueError):
+        floor = None
+    if floor is not None and bbp is not None and floor >= bbp:
+        log.warning("[%s] inverted band (floor %.2f >= ceiling %.2f): floor not enforced",
+                    sym, floor, bbp)
+        floor = None
+    floor_tolerated_pct: Optional[float] = None
+    if floor is not None:
+        tol = ENTRY_FLOOR_TOL_PCT
+        if tol is None:
+            _log_once("floor_tol", "entry-floor tolerance withheld from the public "
+                      "edition; the floor is enforced exactly")
+            tol = 0.0
+        eff_floor = floor * (1.0 - tol / 100.0)
+        if limit_price < eff_floor:
+            log.warning("[%s] T%d skip: limit %.2f < band floor %.2f", sym, tranche_number,
+                        limit_price, floor)
+            _persist_fire_gate_block(sym, sm, gate="entry_band_floor",
+                                     detail=f"limit={limit_price:.2f} < floor={floor:.2f}")
+            return None
+        if limit_price < floor:
+            floor_tolerated_pct = (floor - limit_price) / floor * 100.0
+
+    # --- Tick grid, then the optional marketable-limit slip ---
+    from core import ticks
+    entry_tick, entry_tick_source = ticks.resolve_tick(broker, sym)
+    entry_slip_pct = 0.0
+    if ENTRY_SLIP_PCT is None:
+        _log_once("slip", "entry slip withheld from the public edition; the limit "
+                  "stays at the confirming bar's close")
+    elif ENTRY_SLIP_PCT > 0 and ticks._valid_tick(entry_tick):
+        limit_price = _slip_limit(limit_price, ENTRY_SLIP_PCT, bbp,
+                                  tick=entry_tick, symbol=sym)
+        entry_slip_pct = ENTRY_SLIP_PCT
+
+    # --- Quantity: an explicit V2 leg, a held-name add, or the plan's qty ---
+    if quantity is not None:
+        qty, lock = int(quantity), {tranche_number}
+    elif getattr(pick, "is_topup", False):
+        qty, lock = int(getattr(pick, "topup_qty", 0) or 0), {tranche_number}
+    elif getattr(pick, "plan_qty", None) is not None:
+        qty, lock = int(pick.plan_qty), {1, 2, 3}     # plan mode is single-shot
+    else:
+        # Sizing outside the plan lives in the unpublished portfolio layer.
+        _persist_fire_gate_block(sym, sm, gate="no_plan_qty",
+                                 detail="no plan-sized quantity for this pick")
+        return None
+    if qty <= 0:
+        _persist_fire_gate_block(sym, sm, gate="qty_zero", detail=f"qty={qty}")
+        placed_tranches.setdefault(sym, set()).update(lock)   # retrying cannot help
+        return None
+
+    # --- 5. Completion gate, re-asserted at fire ---
+    if (getattr(pick, "topup_kind", None) or "").lower() == "completion":
+        if position is _POSITION_NOT_THREADED:
+            log.warning("[%s] completion gate NOT re-checked: no position threaded", sym)
+        else:
+            why = _completion_fire_gate(sym, qty=qty, limit_price=limit_price,
+                                        position=position)
+            if why is not None:
+                log.warning("[%s] COMPLETION add REFUSED at fire: %s", sym, why)
+                _persist_fire_gate_block(sym, sm, gate="completion_gate", detail=why)
+                return None
+
+    # --- 6. Talon: the fire-time gate chain, then the broker ---
+    from talon.orders import BrokerTruthUnavailable, DuplicateOrderRefused, place_entry
+    from talon.safety import (InsufficientFireCapital, MacroVetoAtFire,
+                              SectorCapExceeded, SymbolNotAllowed)
+    log.warning("[%s] PLACING %s qty=%d @ Rs %.2f (T%d plan=%s)", sym, purpose, qty,
+                limit_price, tranche_number, getattr(pick, "plan_id", None))
+    try:
+        rec = place_entry(
             broker=broker, symbol=sym, purpose=purpose,
             quantity=qty, limit_price=limit_price,
-            source_run=pick.source_run,
+            source_run=pick.plan_id or pick.source_run,
             tier_at_placement=pick.tier,
             macro_severity_at_placement=sm.macro_severity,
-            intended_size_pct=tranche_fraction,
-            tranche_number=tranche_number,
+            intended_size_pct=1.0, tranche_number=tranche_number,
+            macro_veto_severity=getattr(sm, "macro_veto_severity", None),
+            bar_close=bar_close_raw, entry_slip_pct=entry_slip_pct,
+            floor_tolerated_pct=floor_tolerated_pct,
+            tick_size=entry_tick, tick_source=entry_tick_source,
+            gate_cfg_hash=getattr(sm, "gate_cfg_hash", None),
         )
-        placed_tranches.setdefault(sym, set()).add(tranche_number)
+        placed_tranches.setdefault(sym, set()).update(lock)
+        return rec
+    except DuplicateOrderRefused as e:
+        # Confirmed already placed or held: lock so we stop retrying.
+        log.warning("[%s] %s is a duplicate (%s): marking placed", sym, purpose, e)
+        _persist_fire_gate_block(sym, sm, gate="duplicate", detail=str(e))
+        placed_tranches.setdefault(sym, set()).update(lock)
+    except (MacroVetoAtFire, SectorCapExceeded, SymbolNotAllowed,
+            InsufficientFireCapital) as e:
+        log.warning("[%s] %s FIRE-GATE BLOCK: %s; retry next bar", sym, purpose, e)
+        _persist_fire_gate_block(sym, sm, e)
+    except BrokerTruthUnavailable as e:
+        log.info("[%s] %s skipped, broker truth unreadable (%s); retry next bar",
+                 sym, purpose, e)
+        _persist_fire_gate_block(sym, sm, gate="broker_truth", detail=str(e))
     except Exception as e:
-        log.exception("[%s] T%d place_entry failed: %s", sym, tranche_number, e)
+        log.exception("[%s] %s place_entry failed: %s", sym, purpose, e)
+        _persist_fire_gate_block(sym, sm, gate="placement_error", detail=str(e))
+    return None
 
 
-def _persist_state_machines(sms: dict[str, StateMachine]) -> Path:
-    WATCHER_DIR.mkdir(parents=True, exist_ok=True)
-    path = WATCHER_DIR / f"state_machine_{date.today().isoformat()}.json"
-    payload = {sym: sm.to_dict() for sym, sm in sms.items()}
-    path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    return path
+# --- Fulcrum V2 routing: live or shadow per entry profile ---
+
+def _fv2_master_mode() -> str:
+    """'off' | 'shadow' | 'live'; anything else snaps to 'off' (fail-closed)."""
+    m = (_FV2_MASTER_MODE_SETTING or "").strip().lower()
+    return m if m in ("off", "shadow", "live") else "off"
 
 
-def _print_status(
-    picks: list[ActivePick],
-    sym_states: dict[str, PerSymbolState],
-    sms: dict[str, StateMachine],
-    pos_by_sym: Optional[dict] = None,
-) -> None:
-    # Pull macro from any SM (they all share the same regime at startup)
-    any_sm = next(iter(sms.values()), None)
-    macro_regime = any_sm.macro_regime if any_sm else "?"
-    macro_sev = any_sm.macro_severity if any_sm else 0
-    print("\n" + "=" * 110)
-    print(f" Watcher status @ {datetime.now().isoformat(timespec='seconds')}  "
-          f"MACRO: {macro_regime} (severity {macro_sev})")
-    print("=" * 110)
-    print(f" {'SYMBOL':12} {'TIER':4} {'STATE':>20} {'LTP':>9} {'INVAL':>9} "
-          f"{'MACRO':>6} {'EMA50':>9} {'SLOPE':>10} {'GOLD':>5} {'CLOSEST_ZONE':>16} {'TICKS':>6}")
-    for p in picks:
-        st = sym_states.get(p.symbol)
-        sm = sms.get(p.symbol)
-        ltp_val = st.ltp if st and st.ltp is not None else None
-        ltp = f"{ltp_val:.2f}" if ltp_val is not None else "-"
-        inval = f"{sm.invalidation_price:.2f}" if sm else "-"
-
-        # Macro filter — recompute live from current LTP if available, else
-        # from the last-known close. EMA-50 fallback is wrong (trivially false).
-        if sm and sm.ema_50 is not None and sm.ema_50_slope is not None:
-            ref_price = ltp_val if ltp_val is not None else sm.last_close_price
-            if ref_price is None:
-                macro = "?"
-            else:
-                price_above = ref_price > sm.ema_50
-                slope_up = sm.ema_50_slope > 0
-                macro = "PASS" if (price_above and slope_up) else "BLOCK"
-            ema50 = f"{sm.ema_50:.2f}"
-            slope = f"{sm.ema_50_slope*100:+.3f}%"
-            gold = "Y" if sm.golden_cross_active else "n"
+def _parse_live_profiles(raw: str) -> tuple[frozenset, list]:
+    """Parse the live-profile allowlist into (valid, dropped). Blank -> (empty, [])
+    meaning 'every profile follows the master mode'. Unknown tokens are DROPPED and
+    returned so the caller can warn loudly, never silently."""
+    from zenith.entry_profiles import ALL_PROFILES
+    valid: set = set()
+    dropped: list = []
+    for tok in (raw or "").split(","):
+        t = tok.strip().upper()
+        if not t:
+            continue
+        if t in ALL_PROFILES:
+            valid.add(t)
         else:
-            macro, ema50, slope, gold = "?", "-", "-", "?"
-
-        zones = sm.buy_zones if sm else []
-        closest = ""
-        if zones and ltp_val is not None:
-            closest_z = min(zones, key=lambda z: abs(z.get("price", 0) - ltp_val))
-            closest = f"{closest_z.get('label','?')}@{closest_z.get('price',0):.2f}"
-        elif zones:
-            closest = f"{zones[0].get('label','?')}@{zones[0].get('price',0):.2f}"
-
-        tc = st.tick_count if st else 0
-        state_s = sm.state.value if sm else "no-SM"
-        print(f" {p.symbol:12} {p.tier:>3}  {state_s:>20} {ltp:>9} {inval:>9} "
-              f"{macro:>6} {ema50:>9} {slope:>10} {gold:>5} {closest:>16} {tc:>6}")
-    print()
-
-    # ── Held-only positions (in book, not in today's synth picks) ──
-    pick_syms = {p.symbol for p in picks}
-    held_only = {sym: pos for sym, pos in (pos_by_sym or {}).items() if sym not in pick_syms}
-    if held_only:
-        entry_dd_thresh = _entry_drawdown_alert_threshold_pct()
-        cat_thresh = _catastrophic_move_threshold_pct()
-        print(" Held-only positions (monitor-only — not in today's picks)")
-        print(" " + "-" * 108)
-        print(f" {'SYMBOL':12} {'QTY':>6} {'AVG':>9} {'LTP':>9} {'PnL%':>7} "
-              f"{'CAT_LINE':>10} {'ENTRY_DD_LINE':>14} {'PREV_CLOSE':>11} {'TICKS':>6}")
-        for sym, pos in held_only.items():
-            st = sym_states.get(sym)
-            ltp_val = st.ltp if st and st.ltp is not None else None
-            ltp = f"{ltp_val:.2f}" if ltp_val is not None else "-"
-            avg = pos.avg_entry_price or 0.0
-            pnl_pct = ((ltp_val - avg) / avg * 100.0) if (ltp_val and avg) else None
-            pnl_s = f"{pnl_pct:+.2f}" if pnl_pct is not None else "-"
-            cat_line = (st.prev_close * (1 + cat_thresh / 100.0)) if (st and st.prev_close and cat_thresh is not None) else None
-            cat_line_s = f"{cat_line:.2f}" if cat_line is not None else "-"
-            entry_dd_line = avg * (1 + entry_dd_thresh / 100.0) if (avg and entry_dd_thresh is not None) else None
-            entry_dd_line_s = f"{entry_dd_line:.2f}" if entry_dd_line is not None else "-"
-            prev_close_s = f"{st.prev_close:.2f}" if st and st.prev_close else "-"
-            tc = st.tick_count if st else 0
-            print(f" {sym:12} {pos.total_qty:>6} {avg:>9.2f} {ltp:>9} {pnl_s:>7} "
-                  f"{cat_line_s:>10} {entry_dd_line_s:>14} {prev_close_s:>11} {tc:>6}")
-        print()
+            dropped.append(t)
+    return frozenset(valid), dropped
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────
+def _fv2_effective_mode(session: "WatcherSession", profile: Optional[str]) -> str:
+    """Per-profile effective mode: 'live' ONLY when the master mode is 'live' AND
+    (the allowlist is empty OR this profile is listed); otherwise 'shadow'. Store
+    health is a SEPARATE runtime gate applied at fire time (a degraded campaign
+    store HOLDS an otherwise-live fire). When a profile is live, the V1 machine for
+    that name is demoted to a comparison: its would-fire is logged, not placed."""
+    if getattr(session, "fv2_master_mode", "off") != "live":
+        return "shadow"
+    allow = getattr(session, "fv2_live_profiles", None) or frozenset()
+    if allow and (profile not in allow):
+        return "shadow"
+    return "live"
+
+
+def _fv2_record_leg(session: "WatcherSession", sym: str, leg_name: str, qty: int) -> None:
+    """Record a placed campaign leg in the campaign store (placement evidence, so a
+    restart never re-fires it). Fail-safe."""
+    try:
+        store = getattr(session, "campaign_store", None)
+        rec = store.get(sym) if store is not None else None
+        if rec is None:
+            return
+        from watcher.campaign_store import LegRecord  # not published in the public edition
+        rec.legs[leg_name] = LegRecord(record_id=None,
+                                       placed_at=datetime.now().isoformat(timespec="seconds"),
+                                       qty=int(qty), state="PENDING")
+        store.save()
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("[%s] campaign leg record failed (non-fatal): %s", sym, e)
+
+
+def _fv2_route_live_fire(session: "WatcherSession", sym: str, bar, payload: dict,
+                         qty: int) -> None:
+    """Route a LIVE campaign fire through the SAME `_try_place_entry` chokepoint so
+    every entry gate applies per leg. Records the ACTUAL placed quantity (the
+    partial-funding clamp can shrink an order) on a placed-or-duplicate outcome; a
+    held leg is left unrecorded so it retries next bar."""
+    from talon.orders import ENTRY_V2_CONFIRM, ENTRY_V2_FULL, ENTRY_V2_STARTER
+    leg = payload.get("leg")
+    purpose, tranche = {
+        "starter": (ENTRY_V2_STARTER, 1),
+        "confirmation": (ENTRY_V2_CONFIRM, 2),
+        "full": (ENTRY_V2_FULL, 1),
+    }.get(leg, (None, None))
+    if purpose is None:
+        log.warning("[%s] V2 fire has unknown leg %r: not placing", sym, leg)
+        return
+    pick = (session.pick_by_sym or {}).get(sym)
+    sm = (session.sms or {}).get(sym)
+    if pick is None or sm is None:
+        log.warning("[%s] V2 fire missing pick/sm: cannot place %s leg", sym, leg)
+        return
+    scratch: dict[str, set[int]] = {}
+    rec = _try_place_entry(broker=session.broker, sym=sym, pick=pick, sm=sm,
+                           limit_price=float(bar.close), tranche_number=tranche,
+                           purpose=purpose, placed_tranches=scratch, quantity=int(qty))
+    if tranche in scratch.get(sym, set()):
+        placed_qty = int(qty)
+        try:
+            actual = getattr(rec, "quantity", None) if rec is not None else None
+            if actual is not None and int(actual) > 0:
+                placed_qty = int(actual)
+        except (TypeError, ValueError):
+            pass
+        _fv2_record_leg(session, sym, leg, placed_qty)
+
+
+# --- Loss side: alert-only stop check ---
+
+def _stop_loss_check(session: "WatcherSession", sym: str, pos, ltp: float) -> None:
+    """Per-tick stop check against the ACTUAL deployment cost:
+    LTP at/below avg_entry_price x (1 + threshold/100) writes ONE alert row
+    (`kind=stop_loss_breach`, `action=SHADOW_NO_AUTO_SELL`) per name per session
+    and an ERROR log. It never sells: the operator is the stop-loss, and the
+    pre-open catastrophic check reads these rows. A missing or zero cost basis
+    never fires on a guess."""
+    if STOP_LOSS_THRESHOLD_PCT is None:
+        _log_once("stop", "stop-loss threshold withheld from the public edition; "
+                  "stop check skipped")
+        return
+    if sym in session.exited or sym in session.stop_loss_fired:
+        return
+    avg = pos.avg_entry_price or 0.0
+    if avg <= 0:
+        return
+    stop_level = avg * (1.0 + STOP_LOSS_THRESHOLD_PCT / 100.0)
+    if ltp > stop_level:
+        return
+    log.error("[%s] STOP-LOSS BREACH @ Rs %.2f <= stop Rs %.2f (from avg entry Rs %.2f): "
+              "alert only, operator decides", sym, ltp, stop_level, avg)
+    session.stop_loss_fired.add(sym)
+    try:
+        _write_alert({
+            "kind": "stop_loss_breach", "symbol": sym, "ltp": ltp,
+            "stop_level": stop_level, "avg_entry_price": avg, "qty": pos.total_qty,
+            "action": "SHADOW_NO_AUTO_SELL", "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as e:                                              # noqa: BLE001
+        log.exception("[%s] stop-loss alert write failed: %s", sym, e)
+
+
+# --- Tick handler ---
+
+def _on_ticks(session: "WatcherSession", ws, ticks) -> None:
+    """Route NIFTY ticks to the index trackers and per-symbol ticks through the
+    aggregator, the machine's invalidation guard and the exit-side checks. Every
+    stage is wrapped so one failure cannot disturb the next."""
+    import time as _wall
+    session.tick_stats["count"] += len(ticks)
+    session.tick_stats["last_monotonic"] = _wall.monotonic()
+    for tk in ticks:
+        tok = tk.get("instrument_token")
+
+        # NIFTY feeds both market-health proxies; it is not run through a machine.
+        if tok == session.nifty_token:
+            ltp, vt = tk.get("last_price"), tk.get("volume_traded", 0) or 0
+            if ltp is not None:
+                session.idx_tracker.consume(float(ltp), int(vt))
+                try:
+                    session.nifty_aggregator.consume(float(ltp), int(vt),
+                                                     ts=tk.get("exchange_timestamp"))
+                except Exception as e:                                  # noqa: BLE001
+                    log.debug("nifty aggregator consume failed: %s", e)
+            continue
+
+        sym = session.token_to_symbol.get(tok)
+        if sym is None or sym not in session.sym_states:
+            continue
+        session.sym_states[sym].update_from_tick(tk)
+        ltp = tk.get("last_price")
+        if ltp is None:
+            continue
+        ltp = float(ltp)
+
+        if sym in session.sms:
+            try:
+                session.aggregators[sym].consume(ltp, int(tk.get("volume_traded") or 0),
+                                                 ts=tk.get("exchange_timestamp"))
+            except Exception as e:
+                log.exception("[%s] aggregator failed: %s", sym, e)
+            try:
+                session.sms[sym].on_tick(ltp)
+                # Lower circuit: liquidity dies at the limit; invalidate hard.
+                lim = (session.circuit_limits.get(sym) or {}).get("lower")
+                if lim is not None and ltp <= float(lim):
+                    session.sms[sym].on_lower_circuit()
+            except Exception as e:
+                log.exception("[%s] state machine on_tick failed: %s", sym, e)
+
+        pos = session.pos_by_sym.get(sym)
+        if pos is None:
+            continue
+        # Apex demand accrual for held names (shadow measurement; apex.demand is not
+        # published in the public edition).
+        try:
+            from apex.demand import ApexDemandTracker  # not published in the public edition
+            session.demand_trackers.setdefault(sym, ApexDemandTracker(sym)).consume(tk)
+        except Exception as e:                                          # noqa: BLE001
+            log.debug("[%s] Apex demand accrual failed (non-fatal): %s", sym, e)
+
+        # Target reached: a MARK, not a sell. Apex owns the exit and times it on
+        # demand exhaustion; selling here would pre-empt it.
+        if (sym not in session.exited and sym not in session.target_reached
+                and pos.target_price and pos.target_price > 0 and ltp >= pos.target_price):
+            log.warning("[%s] TARGET REACHED @ Rs %.2f >= Rs %.2f: Apex owns the exit",
+                        sym, ltp, pos.target_price)
+            session.target_reached.add(sym)
+
+        # Apex ratcheted-floor check: take-profit only, sells only when Apex
+        # auto-sell is armed (helper not published in the public edition).
+
+        try:
+            _stop_loss_check(session, sym, pos, ltp)
+        except Exception as e:                                          # noqa: BLE001
+            log.exception("[%s] stop-loss check failed: %s", sym, e)
+
+
+# --- Main loop ---
 
 def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
+    # --- 1. Picks (selection guard + plan overlay) and the held book ---
     picks = load_active_picks(source_run=synth_path)
-    if not picks:
-        log.error("no active picks with structured entry_trigger — nothing to watch.")
-        log.error("re-run the research pass so Stage 4 produces structured "
-                  "triggers, then restart the watcher.")
+    from positions.book import PositionBook
+    open_count = len(PositionBook.load().open_positions())
+    if not picks and open_count == 0:
+        log.error("no active picks and no open positions: nothing to watch.")
         return 2
+    if not picks:
+        # Held positions are monitored independently of today's picks: an empty
+        # roster must never abandon open positions.
+        log.warning("no active picks: EXIT/MONITOR-ONLY mode for %d open position(s)",
+                    open_count)
 
-    log.info("loaded %d picks from synth: %s", len(picks), ", ".join(p.symbol for p in picks))
-
-    # ── Safety invariants — first thing on startup ────────────────────────
+    # --- 2. Safety invariants, broker, session ---
     from talon.safety import assert_safety_invariants, reconcile_holdings
     assert_safety_invariants()
-
     from broker.kite import KiteBroker
     broker = KiteBroker.from_env()
+    from watcher.session import WatcherSession  # not published in the public edition
+    session = WatcherSession(broker=broker)
+    session.pick_by_sym = {p.symbol: p for p in picks}
 
-    # Holdings reconciliation — surface drift between book and broker
     recon = reconcile_holdings(broker)
     if recon.has_drift:
-        log.warning(recon.render())
-    elif not recon.broker_unavailable:
-        log.info("holdings reconciliation OK (%d positions matched)", len(recon.matched))
+        log.warning(recon.render())   # surfaced verbatim, never auto-corrected
 
-    # ── Resolve tokens + refresh technicals ───────────────────────────────
+    # --- 3. Tokens + fresh technicals ---
     sym_to_token: dict[str, int] = {}
     fresh_tech: dict[str, dict] = {}
     for p in picks:
@@ -376,100 +1036,93 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
         except Exception as e:
             log.warning("[%s] token resolve failed: %s", p.symbol, e)
             continue
-        tech = _refresh_technicals(broker, p.symbol, _TECHNICALS_LOOKBACK_DAYS)
-        if tech is None:
-            log.warning("[%s] skipping — no technicals", p.symbol)
-            continue
-        fresh_tech[p.symbol] = tech
-        log.info("[%s] phase=%s knife=%s ema_50=%s slope=%s buy_zones=%d golden=%s",
-                 p.symbol, tech.get("phase"), tech.get("knife_risk_1_to_5"),
-                 tech.get("ema_50"), tech.get("ma_50_slope_pct_per_day"),
-                 len(tech.get("buy_zone", [])), tech.get("golden_cross_active"))
+        tech = _refresh_technicals(broker, p.symbol)
+        if tech is not None:
+            fresh_tech[p.symbol] = tech
+        # (The private edition also re-derives the plan's entry geometry here and
+        # logs any disagreement; the plan row stays the arming band.)
 
-    if not fresh_tech:
-        log.error("no pick could be initialised — exiting")
-        return 2
-
-    # ── Macro regime: read latest from disk, refresh if absent/stale ────────
-    from horizon.regime import load_state as _load_macro, compute_today as _compute_macro
+    # --- 4. Macro read: blocks entries, never liquidates ---
+    from horizon.regime import compute_today as _compute_macro, load_state as _load_macro
     macro = _load_macro()
     if macro is None or macro.as_of != date.today().isoformat():
-        log.info("no macro state for today — computing now")
         try:
             macro = _compute_macro(broker, headlines=None)
         except Exception as e:
-            log.warning("macro compute failed: %s, defaulting to the quiet regime", e)
+            log.warning("macro compute failed: %s; defaulting to the quiet regime", e)
             macro = None
     if macro is not None:
         log.info("MACRO: regime=%s severity=%d event=%s",
                  macro.regime, macro.severity, macro.event_type)
-        # The halt cutoff is withheld from the public edition, so this guarded
-        # path stays inert here. Macro blocks entries; it never liquidates.
-        if _MACRO_HALT_SEVERITY is not None and macro.severity >= _MACRO_HALT_SEVERITY:
-            log.warning("  macro severity at/above the halt threshold — state machine will REFUSE new entries")
 
-    # ── Edge guards: circuit limits + news blackout ─────────────────────────
-    circuit_limits = _fetch_circuit_limits(broker, list(fresh_tech.keys()))
-    for sym, lim in circuit_limits.items():
-        log.info("[%s] circuit lower=%s upper=%s", sym, lim.get("lower"), lim.get("upper"))
-
+    # --- 5. Edge guards: circuit limits + news blackout (fail-closed probe) ---
+    session.circuit_limits = _fetch_circuit_limits(broker, list(fresh_tech))
+    for sym, lim in session.circuit_limits.items():
+        if lim.get("lower") is None or lim.get("upper") is None:
+            # Loud: a missing band means the lower-circuit guard is BLIND for this pick.
+            log.warning("[%s] CIRCUIT LIMITS MISSING: lower-circuit invalidation guard "
+                        "is DISABLED for this pick", sym)
     blackouts: dict[str, Optional[date]] = {}
-    if _NEWS_BLACKOUT_WINDOW_DAYS is None:
-        log.warning("news-blackout window withheld from the public edition; blackout check skipped")
+    blackout_reasons: dict[str, Optional[str]] = {}
+    today = now().astimezone(IST).date()
+    overrides = parse_blackout_overrides()
     for sym in fresh_tech:
-        bo = (_detect_news_blackout(broker, sym, window_days=_NEWS_BLACKOUT_WINDOW_DAYS)
-              if _NEWS_BLACKOUT_WINDOW_DAYS is not None else None)
-        blackouts[sym] = bo
-        if bo:
-            log.warning("[%s] NEWS BLACKOUT active until %s (result filing inside the blackout window)",
-                        sym, bo.isoformat())
+        probe = _detect_news_blackout(broker, sym)
+        bo, why, waived_until, waived_why = effective_blackout(probe, today, overrides, sym)
+        if waived_until is not None:
+            log.warning("[%s] NEWS BLACKOUT until %s (%s) OVERRIDDEN by the operator for "
+                        "today only (manual check declared); every other gate still "
+                        "applies", sym, waived_until.isoformat(), waived_why)
+        elif bo is None and override_applies(overrides, sym, today):
+            log.info("[%s] override entry for today has no effect (no blackout)", sym)
+        blackouts[sym], blackout_reasons[sym] = bo, why
+        if bo is not None and probe.status == BLACKOUT_UNKNOWN:
+            log.warning("[%s] NEWS BLACKOUT (FAIL-CLOSED): the filings fetch FAILED, so "
+                        "the name is blacked out for today; it frees itself tomorrow", sym)
+        elif bo is not None:
+            log.warning("[%s] NEWS BLACKOUT active until %s (%s)", sym, bo.isoformat(), why)
 
+    # --- 6. Gate config: resolved ONCE, stamped into the decision log ---
+    gate_config = GateConfig.resolve()
+    session.gate_config = gate_config
+    gate_cfg_hash = gate_config.config_hash()
+    persist_session_gate_config(gate_config)
+    # One authoritative manifest of the resolved gates (the private edition prints it
+    # here; tolerated when the public GateConfig does not carry the renderer).
+    for line in getattr(gate_config, "manifest_lines", lambda: [])():
+        log.info("  %s", line)
+
+    # --- 7. Index trackers (VWAP gate + EMA-trend proxy, the latter in shadow) ---
     nifty_token = _resolve_nifty_token(broker)
-    log.info("NIFTY 50 token: %d", nifty_token)
+    idx_tracker = IndexVwapTracker()
+    index_trend = IndexTrendTracker()
+    try:
+        from core.contracts import Exchange, Instrument
+        n_inst = Instrument(symbol="NIFTY 50", exchange=Exchange.NSE, token=nifty_token,
+                            tick_size=0.05, lot_size=1)
+        n_candles = broker.historical_candles(n_inst, date.today() - timedelta(days=10),
+                                              date.today(), interval="15minute")
+        if n_candles is not None and not n_candles.empty:
+            index_trend.seed(list(n_candles["close"]))
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("index EMA seed failed (%s); trend proxy unseeded until midday", e)
+    nifty_aggregator = TickBarAggregator(
+        symbol="NIFTY50", on_15m_close=lambda b: index_trend.add_close(b.close),
+        on_1h_close=lambda b: None)
 
-    # ── Build per-symbol containers ───────────────────────────────────────
-    sym_states: dict[str, PerSymbolState] = {}
+    # --- 8. Fulcrum V1 machines (one per pick) + their bar handlers ---
+    from watcher import entry_path  # not published in the public edition
     sms: dict[str, StateMachine] = {}
     aggregators: dict[str, TickBarAggregator] = {}
-    recent_15m: dict[str, list[Bar]] = {}
-    recent_1h: dict[str, list[Bar]] = {}
-    idx_tracker = IndexVwapTracker()
-
-    # Tracks which tranches have already been placed per symbol. Populated
-    # from the position book on startup so a watcher restart doesn't re-place
-    # tranches that already filled in an earlier session.
-    placed_tranches: dict[str, set[int]] = {}
-    # Set of symbols paused for catastrophic intraday move. Fulcrum will not
-    # place new tranches on these. Reset every watcher restart (intentional —
-    # tomorrow is a new day).
-    paused_for_disaster: set[str] = set()
-    catastrophic_threshold = _catastrophic_move_threshold_pct()
-    entry_dd_threshold = _entry_drawdown_alert_threshold_pct()
-    # The catastrophic-move and entry-drawdown alert thresholds are withheld from
-    # the public edition; the alert paths below are skipped when the threshold is
-    # None.
-    log.info("catastrophic-move / entry-drawdown alert thresholds withheld from the public edition")
-    # Session-dedup for the cumulative-from-entry alert; reset on restart.
-    alerted_entry_drawdown: set[str] = set()
-    try:
-        from positions.book import PositionBook
-        _book = PositionBook.load()
-        for _p in _book.open_positions():
-            placed_tranches[_p.symbol] = {t.tranche for t in _p.tranches}
-        if placed_tranches:
-            log.info("placed_tranches recovered from position book: %s",
-                     {k: sorted(v) for k, v in placed_tranches.items()})
-    except Exception as e:
-        log.warning("could not recover placed_tranches from position book: %s", e)
-    pick_by_sym = {p.symbol: p for p in picks}
-
+    sym_states: dict[str, PerSymbolState] = {}
+    trend_mode = getattr(gate_config, "trend", None)
+    htep_on = bool(getattr(getattr(gate_config, "high_tier_profile", None), "enforced", False))
     for p in picks:
-        if p.symbol not in fresh_tech or p.symbol not in sym_to_token:
+        tech = fresh_tech.get(p.symbol)
+        if tech is None or p.symbol not in sym_to_token:
             continue
-        tech = fresh_tech[p.symbol]
-        sym_states[p.symbol] = PerSymbolState(
-            symbol=p.symbol, instrument_token=sym_to_token[p.symbol],
-        )
+        sym_states[p.symbol] = PerSymbolState(symbol=p.symbol,
+                                              instrument_token=sym_to_token[p.symbol])
         sm = StateMachine(
             symbol=p.symbol,
             buy_zones=tech.get("buy_zone", []),
@@ -479,305 +1132,167 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
             ema_200=tech.get("ema_200"),
             golden_cross_active=bool(tech.get("golden_cross_active")),
             news_blackout_until=blackouts.get(p.symbol),
+            news_blackout_reason=blackout_reasons.get(p.symbol),
             last_close_price=tech.get("price"),
             macro_regime=macro.regime if macro else "DRIFT",
             macro_severity=macro.severity if macro else 0,
+            index_gate_mode=getattr(getattr(gate_config, "index", None), "mode", "vwap"),
+            trend_gate_enforced=bool(getattr(trend_mode, "enforced", True)),
+            vol_surge_window=int(_gate_param(gate_config, "vol_surge", "window") or 1),
+            macro_veto_severity=_gate_param(gate_config, "macro_veto", "severity"),
+            stage3_config=getattr(gate_config, "stage3_params", None) or Stage3Config(),
+            entry_cutoff=_gate_param(gate_config, "entry_cutoff", "cutoff"),
+            gate_cfg_hash=gate_cfg_hash,
         )
+        if htep_on and high_tier_profile_eligible(p.tier, p.conviction):
+            sm.high_tier_profile = True
+            sm.htep_vol_multiple = _gate_param(gate_config, "high_tier_profile", "vol_multiple")
         sms[p.symbol] = sm
-        recent_15m[p.symbol] = []
-        recent_1h[p.symbol] = []
-
-        # Closures capture `sym` by default-argument trick to avoid late-binding bugs
-        def make_15m_handler(sym: str = p.symbol):
-            def handler(bar: Bar) -> None:
-                rs = recent_15m[sym]
-                rs.append(bar)
-                if len(rs) > 200:
-                    rs.pop(0)
-                # SMA-20 of bar volumes (use what we have if < 20)
-                window = rs[-21:-1] if len(rs) >= 21 else rs[:-1]
-                sma20v = (sum(b.volume for b in window) / len(window)) if window else float(bar.volume)
-                # Inject current broad-market filter state
-                sms[sym].index_above_vwap = idx_tracker.above_vwap
-                sms[sym].on_15m_bar_close(bar, rs, sma20v)
-
-                # ── Tranche 1 entry on REVERSAL_CONFIRMED ──
-                if (sms[sym].state == State.REVERSAL_CONFIRMED
-                        and 1 not in placed_tranches.get(sym, set())):
-                    _try_place_entry(
-                        broker=broker, sym=sym, pick=pick_by_sym[sym],
-                        sm=sms[sym], limit_price=float(bar.close),
-                        tranche_number=1, purpose="entry_t1",
-                        placed_tranches=placed_tranches,
-                        paused_symbols=paused_for_disaster,
-                    )
-
-                # Loss-side exits are alert-only. Position.stop_price is a
-                # recorded advisory anchor surfaced in `positions list`; the stop
-                # and checkpoint paths write alert rows and the operator sells by
-                # hand. The catastrophic-move alert (separate path) covers the
-                # disaster case. Macro blocks entries and never liquidates.
-            return handler
-
-        def make_1h_handler(sym: str = p.symbol):
-            def handler(bar: Bar) -> None:
-                rh = recent_1h[sym]
-                rh.append(bar)
-                if len(rh) > 50:
-                    rh.pop(0)
-                # 1H EMA-20 — compute from recent_1h
-                if len(rh) >= 20:
-                    from strategies.fallen_angel.technicals import ema as _ema
-                    import pandas as pd
-                    ema_20_1h = _ema(pd.Series([b.close for b in rh]), 20)
-                else:
-                    ema_20_1h = None
-                sms[sym].on_1h_bar_close(bar, ema_20_1h)
-
-                # ── Tranche 2 entry on tranche_2_1h_confirm signal ──
-                tsigs = sms[sym].extras.get("tranche_signals") or []
-                if (any(s.get("level") == "tranche_2_1h_confirm" for s in tsigs)
-                        and 2 not in placed_tranches.get(sym, set())):
-                    _try_place_entry(
-                        broker=broker, sym=sym, pick=pick_by_sym[sym],
-                        sm=sms[sym], limit_price=float(bar.close),
-                        tranche_number=2, purpose="entry_t2",
-                        placed_tranches=placed_tranches,
-                        paused_symbols=paused_for_disaster,
-                    )
-            return handler
-
         aggregators[p.symbol] = TickBarAggregator(
             symbol=p.symbol,
-            on_15m_close=make_15m_handler(),
-            on_1h_close=make_1h_handler(),
+            on_15m_close=entry_path.make_15m_handler(session, p.symbol),
+            on_1h_close=entry_path.make_1h_handler(session, p.symbol),
         )
 
-    # ── Tranche 3: daily higher-high check at startup ─────────────────────
-    # Fires for any symbol with completed T1+T2 (recovered from position book)
-    # whose previous-day daily close cleared the day-before's high.
-    from talon.orders import should_place_t3
-    for sym in list(sms.keys()):
-        already = placed_tranches.get(sym, set())
-        if 1 in already and 2 in already and 3 not in already:
-            sig = should_place_t3(broker, sym)
-            if sig.get("fire"):
-                log.warning("[%s] daily HH established (prev_close %.2f > prior_high %.2f) — placing T3",
-                            sym, sig["prev_close"], sig["prior_high"])
-                _try_place_entry(
-                    broker=broker, sym=sym, pick=pick_by_sym[sym],
-                    sm=sms[sym], limit_price=sig["prev_close"],
-                    tranche_number=3, purpose="entry_t3",
-                    placed_tranches=placed_tranches,
-                    paused_symbols=paused_for_disaster,
-                )
-            else:
-                log.info("[%s] T3 daily-HH check: not yet (%s)",
-                         sym, sig.get("reason", "prev_close <= prior_high"))
+    # --- 9. Fulcrum V2 campaign machines (live or shadow per profile) ---
+    session.fv2_master_mode = _fv2_master_mode()
+    session.fv2_live_profiles, dropped = _parse_live_profiles(_FV2_LIVE_PROFILES_SETTING or "")
+    if dropped:
+        log.warning("Fulcrum V2: unknown live profile(s) DROPPED: %s", ", ".join(dropped))
+    if session.fv2_master_mode in ("shadow", "live"):
+        try:
+            _construct_fv2_session(session, picks=picks, fresh_tech=fresh_tech,
+                                   gate_config=gate_config, macro=macro,
+                                   blackouts=blackouts, blackout_reasons=blackout_reasons)
+        except Exception as e:                                          # noqa: BLE001
+            log.warning("Fulcrum V2 construction failed (%s): V2 inert, V1 unaffected", e)
 
-    # ── Exit-side: open-position monitoring ───────────────────────────────
-    from positions.book import PositionBook
-    exit_book = PositionBook.load()
-    pos_by_sym: dict[str, "Position"] = {p.symbol: p for p in exit_book.open_positions()}
-    # Subscribe to held-position symbols even if they aren't in current picks
-    # (yesterday's pick may be today's hold without being today's signal).
-    # Also build a PerSymbolState for held-only names so on_ticks can update
-    # LTP/prev_close and run the catastrophic + entry-drawdown alert paths.
-    for held_sym, held_pos in pos_by_sym.items():
+    # --- 10. Exit side: held book, checkpoints, Apex, the stop check ---
+    pos_by_sym = {p.symbol: p for p in PositionBook.load().open_positions()}
+    session.pos_by_sym = pos_by_sym
+    for held_sym in pos_by_sym:
+        # Held names are subscribed even when they are not today's picks.
         if held_sym not in sym_to_token:
             try:
                 sym_to_token[held_sym] = broker.resolve_token(held_sym)
-                log.info("[%s] subscribing for exit monitoring (held position, not in picks)", held_sym)
             except Exception as e:
                 log.warning("[%s] held position token resolve failed: %s", held_sym, e)
                 continue
-        if held_sym not in sym_states and held_sym in sym_to_token:
-            sym_states[held_sym] = PerSymbolState(
-                symbol=held_sym, instrument_token=sym_to_token[held_sym],
-            )
-            log.info("[%s] held-only PerSymbolState initialised (no SM; alert-monitor only)", held_sym)
-
-    # ── Exit side (Apex) ──────────────────────────────────────────────────
-    # In production the take-profit machine (Apex, the exit-side mirror of
-    # Fulcrum) evaluates each open position here. When it is armed by
-    # configuration it places the sell through Talon's place_exit; otherwise it
-    # writes an alert. Loss-side exits (the stop and the checkpoints) are
-    # alert-only: they write alert rows and the operator sells by hand. The Apex
-    # module is omitted from this public subset, so the hook is a no-op here.
-
-    # ── Pre-market open: if we're past 9:15, fetch today's open ───────────
-    if _in_market_hours():
+        sym_states.setdefault(held_sym, PerSymbolState(
+            symbol=held_sym, instrument_token=sym_to_token[held_sym]))
+    from watcher import exit_path  # not published in the public edition
+    # Time checkpoints: alert rows only; the operator decides (helper not published).
+    exit_path.run_fail_checkpoints(session, status_only=status_only)
+    exit_path.run_early_checkpoints(session, status_only=status_only)
+    # Plan exit directives: the plan's target and stop ratchet onto the book.
+    plan_exit_directives = exit_path.apply_plan_exit_directives(
+        session, synth_path=synth_path, status_only=status_only)
+    # Apex take-profit: evaluated once at startup, then a per-tick floor watch. It
+    # sells only when armed; the setting is withheld, so it stays shadow here.
+    apex_autosell = _flag_armed(_APEX_AUTOSELL_SETTING)
+    session.apex_autosell = apex_autosell
+    if not status_only:
         try:
-            ohlc = broker._kite.ohlc(  # noqa: SLF001 — direct call to underlying client
-                [f"NSE:{p.symbol}" for p in picks if p.symbol in sms],
-            )
-            today = date.today()
+            summary = _evaluate_apex(broker, macro.severity if macro else 0,
+                                     plan_exit_directives=plan_exit_directives)
+        except Exception as e:                                          # noqa: BLE001
+            summary = {}
+            log.warning("Apex evaluation unavailable (%s); Apex errors never block startup", e)
+        exit_path.dispatch_apex_exits(session, summary, status_only=status_only,
+                                      apex_autosell=apex_autosell)
+    # The stop check is alert-only at every setting (see _stop_loss_check).
+
+    # --- 11. The official open, if we are already past it ---
+    if sms and _in_market_hours():
+        try:
+            ohlc = broker.ohlc_batch(list(sms))
             for sym, sm in sms.items():
-                key = f"NSE:{sym}"
-                if key in ohlc:
-                    op = ohlc[key].get("ohlc", {}).get("open")
-                    if op:
-                        sm.on_pre_market_open(open_price=float(op), today=today)
+                op = (ohlc.get(sym) or {}).get("ohlc", {}).get("open")
+                if op:
+                    sm.on_pre_market_open(open_price=float(op), today=date.today())
         except Exception as e:
-            log.warning("pre-market open fetch failed: %s — deferring until first tick", e)
+            log.warning("open-price fetch failed: %s; deferring to the first tick", e)
 
     if status_only:
-        _print_status(picks, sym_states, sms, pos_by_sym)
+        for sym, sm in sms.items():
+            log.info("STATUS %s state=%s blackout_until=%s", sym, sm.state.value,
+                     sm.news_blackout_until)
+        for sym, pos in pos_by_sym.items():
+            log.info("STATUS held %s qty=%s avg=%s", sym, pos.total_qty, pos.avg_entry_price)
         return 0
 
-    if not _in_market_hours():
-        log.warning("outside market hours (09:15–15:30 IST). "
-                    "Ticker will idle until open.")
-
-    # ── KiteTicker setup ──────────────────────────────────────────────────
+    # --- 12. The ticker ---
     from kiteconnect import KiteTicker
+    kws = KiteTicker(config.KITE_API_KEY, config.KITE_ACCESS_TOKEN, reconnect=True,
+                     reconnect_max_tries=RECONNECT_MAX_TRIES,
+                     reconnect_max_delay=RECONNECT_MAX_DELAY)
+    tick_stats = {"count": 0, "last_monotonic": None}
+    session.sym_states, session.sms, session.aggregators = sym_states, sms, aggregators
+    session.sym_to_token = sym_to_token
+    session.token_to_symbol = {tok: s for s, tok in sym_to_token.items()}
+    session.nifty_token, session.idx_tracker = nifty_token, idx_tracker
+    session.index_trend, session.nifty_aggregator = index_trend, nifty_aggregator
+    # Tranches already on the book are recovered so a restart never re-fires them.
+    session.placed_tranches = {p.symbol: {t.tranche for t in p.tranches}
+                               for p in pos_by_sym.values()}
+    session.target_reached = set()
+    session.demand_trackers, session.tick_stats = {}, tick_stats
 
-    kws = KiteTicker(config.KITE_API_KEY, config.KITE_ACCESS_TOKEN)
+    def _on_connect(ws, response):
+        tokens = list(sym_to_token.values()) + [nifty_token]
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_FULL, tokens)
+        log.info("subscribed %d token(s)", len(tokens))
 
-    token_to_symbol = {tok: sym for sym, tok in sym_to_token.items()}
+    kws.on_ticks = lambda ws, ticks: _on_ticks(session, ws, ticks)
+    kws.on_connect = _on_connect
+    # (The private edition also wires close / error / reconnect / no-reconnect
+    # handlers in a lifecycle module that is not published.)
 
-    def on_ticks(ws, ticks):
-        for tk in ticks:
-            tok = tk.get("instrument_token")
+    # --- 13. Watchdogs, prior-day reconcile, the reconcile daemon ---
+    deliberate_close = {"value": False}
+    _start_market_close_watchdog(kws, deliberate_close)
+    _start_heartbeat(tick_stats, sms)
+    _start_stall_watchdog(tick_stats, sms)
+    try:
+        # Book overnight fills stranded PENDING on prior days BEFORE the session arms
+        # (the in-session daemon only sees today's orders).
+        from talon.orders import reconcile_prior_day_pending
+        reconcile_prior_day_pending(broker)
+    except Exception as e:                                              # noqa: BLE001
+        log.warning("prior-day reconcile failed at startup (non-fatal): %s", e)
+    _start_reconcile_daemon(broker, on_fill=lambda: exit_path.refresh_positions(session))
 
-            # ── Nifty index updates the VWAP tracker; not run through SM ──
-            if tok == nifty_token:
-                ltp = tk.get("last_price")
-                vt = tk.get("volume_traded", 0) or 0
-                if ltp is not None:
-                    idx_tracker.consume(float(ltp), int(vt))
-                continue
-
-            sym = token_to_symbol.get(tok)
-            if sym is None or sym not in sym_states:
-                continue
-
-            st = sym_states[sym]
-            st.update_from_tick(tk)
-
-            ltp = tk.get("last_price")
-            if ltp is None:
-                continue
-            ltp = float(ltp)
-            cv = int(tk.get("volume_traded") or 0)
-
-            # ── SM/aggregator path — only for synth picks ──
-            if sym in sms:
-                try:
-                    ts = tk.get("exchange_timestamp")
-                    aggregators[sym].consume(ltp, cv, ts=ts)
-                except Exception as e:
-                    log.exception("[%s] aggregator failed: %s", sym, e)
-
-                try:
-                    sms[sym].on_tick(ltp)
-                    # Lower-circuit guard: liquidity dies at the limit; invalidate hard.
-                    lim = (circuit_limits.get(sym) or {}).get("lower")
-                    if lim is not None and ltp <= float(lim):
-                        sms[sym].on_lower_circuit()
-                except Exception as e:
-                    log.exception("[%s] state machine on_tick failed: %s", sym, e)
-
-            # ── Take-profit side: owned by Apex (see the exit-side hook above) ──
-            pos = pos_by_sym.get(sym)
-
-            # ── Catastrophic intraday move — halt + alert, NO auto-sell ──
-            # Anti-disaster floor (the per-name stop is alert-only).
-            # Pauses Fulcrum on the name; user decides whether to exit.
-            if (pos and sym not in paused_for_disaster
-                    and catastrophic_threshold is not None
-                    and st.prev_close and st.prev_close > 0):
-                move_pct = (ltp - st.prev_close) / st.prev_close * 100.0
-                if move_pct <= catastrophic_threshold:
-                    log.error("[%s] CATASTROPHIC MOVE %.2f%% ltp=%.2f prev_close=%.2f "
-                              "(threshold %.2f%%) — pausing Fulcrum on this name; "
-                              "no auto-sell; user decides",
-                              sym, move_pct, ltp, st.prev_close, catastrophic_threshold)
-                    paused_for_disaster.add(sym)
-                    try:
-                        _write_alert({
-                            "kind": "catastrophic_intraday_move",
-                            "symbol": sym,
-                            "ltp": ltp,
-                            "prev_close": st.prev_close,
-                            "move_pct": round(move_pct, 2),
-                            "threshold_pct": catastrophic_threshold,
-                            "timestamp": datetime.now().isoformat(),
-                            "position_id": pos.id if hasattr(pos, "id") else None,
-                            "action": "PAUSED_FULCRUM_NO_AUTO_SELL",
-                        })
-                    except Exception as e:
-                        log.exception("[%s] alert write failed: %s", sym, e)
-
-            # ── Cumulative-from-entry drawdown — alert only, dedup per session ──
-            # Catches the slow grind-down case the intraday check misses.
-            # Does NOT pause Fulcrum (name may still be in a legit buy zone for
-            # tranche-2/3 reload); user decides whether to act.
-            if pos and entry_dd_threshold is not None and sym not in alerted_entry_drawdown:
-                avg = pos.avg_entry_price
-                if avg and avg > 0:
-                    entry_dd_pct = (ltp - avg) / avg * 100.0
-                    if entry_dd_pct <= entry_dd_threshold:
-                        log.error("[%s] ENTRY DRAWDOWN %.2f%% ltp=%.2f avg_entry=%.2f "
-                                  "(threshold %.2f%%) — alert only; user decides",
-                                  sym, entry_dd_pct, ltp, avg, entry_dd_threshold)
-                        alerted_entry_drawdown.add(sym)
-                        try:
-                            _write_alert({
-                                "kind": "entry_drawdown",
-                                "symbol": sym,
-                                "ltp": ltp,
-                                "avg_entry_price": avg,
-                                "entry_dd_pct": round(entry_dd_pct, 2),
-                                "threshold_pct": entry_dd_threshold,
-                                "qty": pos.total_qty,
-                                "timestamp": datetime.now().isoformat(),
-                                "position_id": pos.id if hasattr(pos, "id") else None,
-                                "action": "ALERT_NO_AUTO_SELL",
-                            })
-                        except Exception as e:
-                            log.exception("[%s] entry-drawdown alert write failed: %s", sym, e)
-
-    def on_connect(ws, response):
-        token_list = list(sym_to_token.values()) + [nifty_token]
-        ws.subscribe(token_list)
-        ws.set_mode(ws.MODE_FULL, token_list)
-        log.info("ticker connected; subscribed to %d tokens (%d picks + NIFTY 50)",
-                 len(token_list), len(sym_to_token))
-
-    def on_close(ws, code, reason):
-        log.info("ticker closed: code=%s reason=%s", code, reason)
-        for sym, agg in aggregators.items():
-            agg.flush_at_close()
-
-    def on_error(ws, code, reason):
-        log.warning("ticker error: code=%s reason=%s", code, reason)
-
-    kws.on_ticks = on_ticks
-    kws.on_connect = on_connect
-    kws.on_close = on_close
-    kws.on_error = on_error
-
-    log.info("starting ticker — blocks until disconnect (Ctrl+C to stop)")
+    log.info("starting ticker: blocks until disconnect, market close, or Ctrl+C")
     try:
         kws.connect()
     except KeyboardInterrupt:
-        log.info("interrupted — flushing bars and persisting state")
+        deliberate_close["value"] = True
     finally:
-        for sym, agg in aggregators.items():
+        for agg in aggregators.values():
             agg.flush_at_close()
-        out_path = _persist_state_machines(sms)
-        log.info("state machines persisted to %s",
-                 out_path.relative_to(config.PROJECT_ROOT))
+        if config.LIVE_TRADING_ENABLED:
+            try:
+                from talon.orders import reconcile_pending
+                log.info("shutdown reconcile: %s", reconcile_pending(broker))
+            except Exception as e:                                      # noqa: BLE001
+                log.warning("shutdown reconcile failed (non-fatal): %s", e)
+
+    # connect() returned mid-session without a deliberate stop: never go dark on
+    # live positions; signal the supervisor to restart.
+    if not deliberate_close["value"] and _in_market_hours():
+        log.error("ticker returned mid-session WITHOUT a deliberate stop; exiting %d",
+                  STALL_EXIT_CODE)
+        return STALL_EXIT_CODE
     return 0
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────
+# --- CLI ---
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(description="Kestrel live tick watcher")
     ap.add_argument("--synth", type=Path, default=None,
-                    help="Path to a specific synth json (default: latest in state/synthesis/)")
+                    help="Path to a specific synth json (default: the guarded selection)")
     ap.add_argument("--status", action="store_true",
                     help="Print a one-shot status snapshot and exit (no subscribe)")
     args = ap.parse_args(argv[1:])

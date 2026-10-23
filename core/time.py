@@ -2,7 +2,7 @@
 NSE calendar + IST clock.
 
 All datetimes in Kestrel are timezone-aware IST. `now()` is the only call site
-for "current time" — monkey-patch it in tests to freeze the clock.
+for "current time": monkey-patch it in tests to freeze the clock.
 
 Holiday support: a weekday check against the `NSE_HOLIDAYS` set below. Live
 execution also relies on the broker to reject orders on a closed day, so a

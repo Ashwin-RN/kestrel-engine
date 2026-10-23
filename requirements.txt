@@ -10,11 +10,15 @@ numpy==2.5.2
 # Broker
 kiteconnect==5.2.1
 
-# LLM providers
+# LLM providers (the OpenRouter and Gemini tiers use plain HTTP)
 anthropic==1.0.0
 ollama==0.6.2
 
 # News and sentiment (FinBERT). transformers needs a CPU build of torch
 # installed first; the pinned build is torch 2.13.0.
 transformers==5.15.1
+huggingface_hub==1.28.0
 feedparser==6.0.14
+
+# Exchange data checks
+requests==2.34.2

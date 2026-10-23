@@ -9,12 +9,18 @@ structured `Technicals` dict consumed by:
   - the live tick watcher (which evaluates the entry triggers against these
     metrics in milliseconds)
 
-Outputs are intentionally exhaustive — every signal the watcher might need to
+Outputs are intentionally exhaustive: every signal the watcher might need to
 evaluate is precomputed here so the hot path stays LLM-free.
 
 Phase and knife_risk are rule-based composites. Downstream review may dispute
 them when news or sector context contradicts the math (e.g. corp-action
 artifact bounces that look BOUNCING numerically but should be ignored).
+
+Public edition: the textbook indicators (RSI-14, ATR-14, SMA/EMA-20/50/200,
+anchored VWAP, volume profile, pivots, ADX) are shown in full. The phase rule
+boundaries, the knife-risk weights and bounds, the phase-coherence cutoff and
+the buy-zone proximity band are withheld; each withheld constant is None and
+its step reports that it was skipped.
 """
 
 from __future__ import annotations
@@ -30,11 +36,25 @@ log = logging.getLogger("vector.technicals")
 
 # The RSI bands that feed the phase rule are tuned and withheld from the public
 # edition; the derived signals read None when the bands are not supplied.
-_RSI_STRONG_ABOVE: Optional[float] = None
-_RSI_WEAK_BELOW: Optional[float] = None
+_RSI_STRONG_ABOVE: Optional[float] = None  # withheld from the public edition
+_RSI_WEAK_BELOW: Optional[float] = None    # withheld from the public edition
+
+# The knife-risk level at or above which a calm phase label is clamped to
+# INDETERMINATE (see apply_phase_coherence_clamp).
+PHASE_CLAMP_KNIFE_CUTOFF: Optional[int] = None  # withheld from the public edition
+
+# Knife-risk calibration. The 5-day move is scored in ATR units so the
+# magnitude signal is volatility-comparable across the universe; the move
+# threshold in ATR units and the days-since-low "stable" bound are tuned.
+KNIFE_ATR_MOVE_THRESHOLD: Optional[float] = None    # withheld from the public edition
+KNIFE_DAYS_SINCE_LOW_STABLE: Optional[int] = None   # withheld from the public edition
+
+# A bar "reaches" the 52-week high within this relative tolerance, so a high
+# passed in from the scan (rounded to the paisa) still finds its own row.
+HIGH_52W_MATCH_TOL = 1e-4
 
 
-# ── Indicators ─────────────────────────────────────────────────────────────
+# --- Indicators --------------------------------------------------------------
 
 def rsi(closes: pd.Series, period: int = 14) -> Optional[float]:
     """Wilder's RSI on the close series."""
@@ -52,7 +72,7 @@ def rsi(closes: pd.Series, period: int = 14) -> Optional[float]:
 
 
 def atr(candles: pd.DataFrame, period: int = 14) -> Optional[float]:
-    """Average True Range — volatility measure."""
+    """Average True Range: volatility measure."""
     if len(candles) < period + 1:
         return None
     high = candles["high"].astype(float)
@@ -88,7 +108,7 @@ def sma_slope_pct_per_day(closes: pd.Series, period: int, lookback: int = 5) -> 
 
 
 def ema(closes: pd.Series, period: int) -> Optional[float]:
-    """Exponential moving average — current value only."""
+    """Exponential moving average: current value only."""
     if len(closes) < period:
         return None
     val = closes.ewm(span=period, adjust=False).mean().iloc[-1]
@@ -157,8 +177,8 @@ def volume_profile_hvn(
 
 
 def pivot_levels(closes: pd.Series, window: int = 5, *, kind: str = "low") -> list[float]:
-    """Local pivot lows/highs — center bar is min/max of `window` bars on each side.
-    Returns sorted, near-duplicates clustered within 1%."""
+    """Local pivot lows/highs: the center bar is the min/max of `window` bars on
+    each side. Returns sorted, near-duplicates clustered within 1%."""
     if len(closes) < 2 * window + 1:
         return []
     arr = closes.values
@@ -176,7 +196,7 @@ def pivot_levels(closes: pd.Series, window: int = 5, *, kind: str = "low") -> li
     return clustered
 
 
-# ── Exit-side primitives (recovery-exhaustion detector, consumed by Apex) ──
+# --- Exit-side primitives (recovery-exhaustion detector, consumed by Apex) ---
 
 def adx(candles: pd.DataFrame, period: int = 14) -> Optional[float]:
     """Wilder's Average Directional Index, trend strength, 0-100.
@@ -205,8 +225,8 @@ def adx(candles: pd.DataFrame, period: int = 14) -> Optional[float]:
 
     alpha = 1 / period
     atr_s = tr.ewm(alpha=alpha, adjust=False).mean()
-    # Use np.nan (not pd.NA) on zero-divisions so dtype stays float64 — pd.NA
-    # promotes to object dtype which breaks the chained .ewm() below.
+    # Use np.nan (not pd.NA) on zero-divisions so dtype stays float64: pd.NA
+    # promotes to object dtype, which breaks the chained .ewm() below.
     plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s.where(atr_s != 0, np.nan)
     minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s.where(atr_s != 0, np.nan)
     di_sum = plus_di + minus_di
@@ -268,9 +288,11 @@ def relative_strength_drift(
     stock_closes: pd.Series,
     sector_closes: pd.Series,
     *,
-    window: int = 5,
+    window: int,
 ) -> Optional[float]:
-    """Stock return minus sector return over the last `window` bars.
+    """Stock return minus sector return over the last `window` bars (the
+    caller supplies the window; the exit-side value is withheld from the
+    public edition).
 
     Negative values mean the stock is underperforming the sector. An exit-side
     signal fires when this drift falls below a tuned threshold (withheld from
@@ -293,7 +315,7 @@ def relative_strength_drift(
     return round(stock_ret - sector_ret, 6)
 
 
-# ── Volume metrics ─────────────────────────────────────────────────────────
+# --- Volume metrics ----------------------------------------------------------
 
 def volume_metrics(candles: pd.DataFrame) -> dict:
     """5d/20d volume ratio + up/down volume in last 5 days."""
@@ -320,7 +342,7 @@ def volume_metrics(candles: pd.DataFrame) -> dict:
     }
 
 
-# ── Phase classification ──────────────────────────────────────────────────
+# --- Phase classification ----------------------------------------------------
 
 def _sequence_signals(closes: pd.Series, lookback: int = 20) -> dict:
     """Count consecutive higher-lows and lower-lows in the last `lookback` daily-low pivots."""
@@ -362,7 +384,12 @@ def classify_phase(
 ) -> tuple[str, dict]:
     """Rule-based phase classification.
 
-    Returns (phase, signal_dict). Phase ∈ {FALLING, BOTTOMING, STABILIZING, BOUNCING}.
+    Returns (phase, signal_dict). Phase is one of
+    {FALLING, BOTTOMING, STABILIZING, BOUNCING, INDETERMINATE}
+    (UNKNOWN is the empty-data sentinel). INDETERMINATE is the honest catch-all:
+    no rule cleanly matched, so the fall-through is NOT dressed up as
+    STABILIZING. See ``apply_phase_coherence_clamp`` for the danger-composite
+    override that also yields INDETERMINATE.
     """
     if closes.empty:
         return "UNKNOWN", {}
@@ -380,10 +407,13 @@ def classify_phase(
     hl = seq.get("consecutive_higher_lows", 0)
     ll = seq.get("consecutive_lower_lows", 0)
     ma_aligned_up = (ma_20 is not None and ma_50 is not None and ma_20 > ma_50)
-    rsi_strong = ((rsi_14 > _RSI_STRONG_ABOVE)
-                  if (rsi_14 is not None and _RSI_STRONG_ABOVE is not None) else None)
-    rsi_weak = ((rsi_14 < _RSI_WEAK_BELOW)
-                if (rsi_14 is not None and _RSI_WEAK_BELOW is not None) else None)
+    if _RSI_STRONG_ABOVE is None or _RSI_WEAK_BELOW is None:
+        # RSI bands withheld from the public edition: the band signals read None.
+        rsi_strong = None
+        rsi_weak = None
+    else:
+        rsi_strong = (rsi_14 is not None and rsi_14 > _RSI_STRONG_ABOVE)
+        rsi_weak = (rsi_14 is not None and rsi_14 < _RSI_WEAK_BELOW)
 
     signals = {
         "close_vs_5d_high_pct": round(close_vs_5d_high, 4),
@@ -396,16 +426,42 @@ def classify_phase(
 
     # Decision rules withheld from the public edition. The production version
     # maps the signals above (sequence counts, close-versus-range, RSI bands, and
-    # MA alignment) to a phase in {FALLING, BOTTOMING, STABILIZING, BOUNCING} via
-    # tuned boundaries that are part of the edge. The signals are shown; the rule
-    # boundaries are not published.
-    phase = "STABILIZING"  # neutral placeholder; rule boundaries not published
+    # MA alignment) to a phase via ordered, first-match-wins rules with tuned
+    # boundaries that are part of the edge, and falls through to INDETERMINATE
+    # when no rule matches. The signals are shown; the rule boundaries are not
+    # published, so this edition always takes the honest fall-through.
+    phase = "INDETERMINATE"
     signals["note"] = "phase-classification boundaries withheld from the public edition"
 
     return phase, signals
 
 
-# ── Knife risk composite ──────────────────────────────────────────────────
+def apply_phase_coherence_clamp(phase: str, knife_risk: int) -> str:
+    """Resolve a phase label that contradicts the knife-risk danger composite.
+
+    ``classify_phase`` and ``knife_risk`` are two independent deterministic reads
+    that were allowed to flatly contradict: a name could read STABILIZING /
+    BOUNCING while the dedicated danger composite read high. A high
+    falling-knife danger may not wear a calm phase label, so such a name is
+    relabelled INDETERMINATE (the same honest "the deterministic read is
+    unreliable here" label the catch-all uses). FALLING / BOTTOMING / UNKNOWN /
+    INDETERMINATE are never clamped; a knife risk below the cutoff is untouched.
+
+    Applied as a post-step in ``compute_technicals`` AFTER both phase and
+    knife_risk exist: ``classify_phase`` does not receive knife_risk, by design.
+    The cutoff is withheld from the public edition; without it the clamp is
+    skipped and the phase passes through unchanged.
+    """
+    if PHASE_CLAMP_KNIFE_CUTOFF is None:
+        log.debug("phase coherence clamp skipped: cutoff withheld from the public edition")
+        return phase
+    if (isinstance(knife_risk, int) and knife_risk >= PHASE_CLAMP_KNIFE_CUTOFF
+            and phase in ("STABILIZING", "BOUNCING")):
+        return "INDETERMINATE"
+    return phase
+
+
+# --- Knife risk composite ----------------------------------------------------
 
 def knife_risk(
     closes: pd.Series,
@@ -414,14 +470,17 @@ def knife_risk(
     ma_50: Optional[float],
     ma_50_slope: Optional[float],
     days_since_52w_low: Optional[int],
+    atr_pct: Optional[float] = None,
 ) -> tuple[int, dict]:
     """Composite knife risk 1..5. Higher = still falling, lower = stabilized.
 
     The component inputs are exposed in the signal block so a reviewer can
-    dispute the score; the weights themselves are withheld in this edition.
+    dispute the score. `atr_pct` (daily ATR as a fraction of price)
+    volatility-normalizes the 5-day-move magnitude signal: the same raw % move
+    counts as a knife on a quiet name but as noise on a volatile one.
     """
     if closes.empty or len(closes) < 10:
-        return 3, {"note": "insufficient data, defaulted to 3"}
+        return 3, {"note": "insufficient data, defaulted to the scale midpoint"}
 
     last = float(closes.iloc[-1])
     last_5 = closes.tail(5).astype(float)
@@ -430,25 +489,32 @@ def knife_risk(
     down_days_last_10 = int((last_10.diff() < 0).sum())
     up_down_ratio = vol.get("up_down_ratio_5d")
 
+    # 5-day move expressed in daily-ATR units (None when ATR unavailable).
+    move_in_atr = (last_5d_change_pct / atr_pct) if (atr_pct and atr_pct > 0) else None
+
     components: dict = {
         "last_5d_change_pct": round(last_5d_change_pct, 4),
+        "last_5d_change_in_atr": round(move_in_atr, 3) if move_in_atr is not None else None,
+        "atr_pct": atr_pct,
         "down_days_last_10": down_days_last_10,
         "up_down_ratio_5d": up_down_ratio,
         "ma_50_slope_pct_per_day": ma_50_slope,
         "days_since_52w_low": days_since_52w_low,
+        # Calibration echoes: withheld from the public edition.
+        "knife_atr_move_threshold": None,
+        "days_since_low_stable_days": None,
     }
 
-    # Scoring withheld from the public edition. The production version assigns
-    # tuned weights to each component above (recent change, down-day count,
-    # up/down volume ratio, MA-50 slope, time since the 52-week low) and maps
-    # the result onto the 1..5 scale. The weights and the bounds are part of the
-    # edge and are not published. The inputs the score considers are shown; the
-    # public edition returns the scale's midpoint so the structure stays exercisable.
-    components["note"] = "knife-risk component weights withheld from the public edition"
+    # Scoring: weights and bounds withheld from the public edition. The inputs
+    # the score considers are shown above; this edition returns the scale
+    # midpoint so the structure stays exercisable.
+    if KNIFE_ATR_MOVE_THRESHOLD is None or KNIFE_DAYS_SINCE_LOW_STABLE is None:
+        log.debug("knife-risk scoring skipped: calibration withheld from the public edition")
+    components["note"] = "knife-risk weights and bounds withheld from the public edition"
     return 3, components
 
 
-# ── Top-level ──────────────────────────────────────────────────────────────
+# --- Top-level ---------------------------------------------------------------
 
 def compute_technicals(
     candles: pd.DataFrame,
@@ -459,7 +525,7 @@ def compute_technicals(
 ) -> dict:
     """Compute every technical metric the watcher and LLM agent need.
 
-    `candles`: DataFrame with date, open, high, low, close, volume — chronological.
+    `candles`: DataFrame with date, open, high, low, close, volume, chronological.
     Returns a flat dict suitable for JSON serialization.
     """
     if candles.empty:
@@ -469,24 +535,47 @@ def compute_technicals(
     last_price = float(price) if price is not None else float(closes.iloc[-1])
     h52 = float(high_52w) if (high_52w and high_52w > 0) else float(candles["high"].astype(float).max())
     l52 = float(candles["low"].astype(float).min())
+    l52_close = float(closes.min())
 
-    # Dates
+    # Dates. Each level is dated from the row it came from: `low_52w` is the
+    # lowest LOW, so `days_since_52w_low` counts from that row, and `high_52w`
+    # (the scan's high when passed, else the highest HIGH) from the newest row
+    # whose HIGH reaches it. Dating them off the lowest and highest CLOSE instead
+    # picks a different row on a large share of names, sometimes months apart.
+    # The lowest CLOSE keeps its own pair, `low_52w_close` and
+    # `days_since_52w_close_low`: the knife-risk recency leg and the AVWAP
+    # anchor read that row.
+    days_since_low = days_since_high = days_since_close_low = None
+    high_dated_from = None
+    idx_low = None
     if "date" in candles.columns:
         last_date = candles["date"].iloc[-1]
         idx_low = candles["close"].astype(float).idxmin()
-        idx_high = candles["close"].astype(float).idxmax()
-        date_low = candles["date"].iloc[idx_low if isinstance(idx_low, int) else candles.index.get_loc(idx_low)]
-        date_high = candles["date"].iloc[idx_high if isinstance(idx_high, int) else candles.index.get_loc(idx_high)]
+
+        def _pos(label) -> int:
+            return label if isinstance(label, int) else candles.index.get_loc(label)
+
         def _days_between(a, b) -> Optional[int]:
             try:
                 return int((pd.Timestamp(a) - pd.Timestamp(b)).days)
             except Exception:
                 return None
-        days_since_low = _days_between(last_date, date_low)
-        days_since_high = _days_between(last_date, date_high)
-    else:
-        days_since_low = None
-        days_since_high = None
+
+        def _days_since_row(pos: int) -> Optional[int]:
+            return _days_between(last_date, candles["date"].iloc[pos])
+
+        days_since_close_low = _days_since_row(_pos(idx_low))
+        days_since_low = _days_since_row(_pos(candles["low"].astype(float).idxmin()))
+        highs = candles["high"].astype(float).to_numpy()
+        reaching = np.flatnonzero(highs >= h52 * (1.0 - HIGH_52W_MATCH_TOL))
+        if reaching.size:
+            days_since_high = _days_since_row(int(reaching[-1]))
+            high_dated_from = "matching_high_row"
+        else:
+            # The passed high sits above every bar in the window (a shorter
+            # window than the scan's), so the window's own highest HIGH dates it.
+            days_since_high = _days_since_row(int(np.argmax(highs)))
+            high_dated_from = "window_max_high_row"
 
     # Indicators
     rsi_14 = rsi(closes, 14)
@@ -500,7 +589,12 @@ def compute_technicals(
     vol = volume_metrics(candles)
     seq = _sequence_signals(closes)
     phase, phase_signals = classify_phase(closes, ma_20, ma_50, rsi_14, seq)
-    knife, knife_signals = knife_risk(closes, candles, vol, ma_50, ma_50_slope, days_since_low)
+    knife, knife_signals = knife_risk(closes, candles, vol, ma_50, ma_50_slope,
+                                      days_since_close_low, atr_pct)
+    knife_signals["days_since_low_basis"] = "lowest_close_row"
+    # Coherence post-step: a high knife-risk name may not wear a STABILIZING /
+    # BOUNCING label (the two deterministic composites must not contradict).
+    phase = apply_phase_coherence_clamp(phase, knife)
 
     # EMAs and golden-cross macro filter
     ema_50 = ema(closes, 50)
@@ -509,8 +603,8 @@ def compute_technicals(
         ema_50 is not None and ema_200 is not None and ema_50 > ema_200
     )
 
-    # Anchored VWAP — defaults to the 52W-low bar (regime-shift anchor).
-    # Earnings-date anchor is a future extension once we wire Stage 3 dates.
+    # Anchored VWAP: defaults to the 52W-low bar (regime-shift anchor).
+    # Earnings-date anchor is a future extension.
     avwap_from_52w_low = None
     if isinstance(idx_low, int) and 0 <= idx_low < len(candles):
         avwap_from_52w_low = anchored_vwap(candles, idx_low)
@@ -521,7 +615,7 @@ def compute_technicals(
         except Exception:
             avwap_from_52w_low = None
 
-    # Volume profile — HVN + POC at two lookbacks for confluence
+    # Volume profile: HVN + POC at two lookbacks for confluence
     hvn_90 = volume_profile_hvn(candles, lookback=90)
     hvn_180 = volume_profile_hvn(candles, lookback=180) if len(candles) >= 100 else {}
 
@@ -564,6 +658,9 @@ def compute_technicals(
         "rebound_from_52w_low_pct": round(rebound_pct, 4),
         "days_since_52w_high": days_since_high,
         "days_since_52w_low": days_since_low,
+        "high_52w_dated_from": high_dated_from,
+        "low_52w_close": round(l52_close, 2),
+        "days_since_52w_close_low": days_since_close_low,
         "rsi_14": round(rsi_14, 2) if rsi_14 is not None else None,
         "ma_20": round(ma_20, 2) if ma_20 is not None else None,
         "ma_50": round(ma_50, 2) if ma_50 is not None else None,
@@ -576,6 +673,7 @@ def compute_technicals(
         "supports": [round(s, 2) for s in supports[:6]],
         "resistances": [round(r, 2) for r in resistances[-6:]],
         "avwap_from_52w_low": round(avwap_from_52w_low, 2) if avwap_from_52w_low is not None else None,
+        "avwap_anchor": "lowest_close_row",
         "volume_profile_90d": hvn_90,
         "volume_profile_180d": hvn_180,
         "buy_zone": buy_zone,

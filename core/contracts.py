@@ -29,9 +29,9 @@ class OrderType(Enum):
 
 
 class Product(Enum):
-    CNC = "CNC"      # Cash & Carry — delivery
+    CNC = "CNC"      # Cash & Carry (delivery)
     MIS = "MIS"      # Margin Intraday Square-off
-    NRML = "NRML"    # Normal — overnight F&O
+    NRML = "NRML"    # Normal (overnight F&O)
 
 
 class Exchange(Enum):
@@ -94,7 +94,7 @@ class Position:
 
 @dataclass
 class Trade:
-    """A completed round-trip: entry → exit. One row per trade in the journal."""
+    """A completed round-trip: entry to exit. One row per trade in the journal."""
     strategy: str
     instrument: Instrument
     side: Side

@@ -1,4 +1,4 @@
-"""Engram — per-symbol council file writer.
+"""Engram - per-symbol council file writer.
 
 After a council run, this module writes one markdown file per pick that
 the council touched, capturing what each voice said and how the primary
@@ -8,9 +8,9 @@ author responded. The files live at:
 
 Future probes can read past council notes to surface relevant prior
 reasoning ("this name was council-flagged 3 months ago on catalyst-timing
-concerns — has that resolved?"). The format is markdown, not JSON, because
-the primary consumers are humans and the next council round (which can
-include the file content as context).
+concerns - has that resolved?"). The format is markdown, not JSON, because
+the primary consumer is the operator; no analysis stage reads these files
+back today.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def write_council_files(
     """Write per-symbol council notes. Returns the list of paths written.
 
     Writes for every symbol that appeared in the original ranked_picks
-    (regardless of whether tier changed) — silence is also data.
+    (regardless of whether tier changed) - silence is also data.
     Aborted council runs (no revision) get a single 'aborted' note per
     symbol so the audit trail is never empty.
     """
@@ -55,11 +55,11 @@ def write_council_files(
         voice_concerns_by_sym[voice.agent] = {}
         voice_rej_questions_by_sym[voice.agent] = {}
         voice_alt_perspectives[voice.agent] = []
-        voice_pressure[voice.agent] = "—"
+        voice_pressure[voice.agent] = "-"
         if not voice.succeeded or not voice.raw_response:
             continue
         resp = voice.raw_response
-        voice_pressure[voice.agent] = resp.get("consensus_pressure", "—")
+        voice_pressure[voice.agent] = resp.get("consensus_pressure", "-")
         voice_alt_perspectives[voice.agent] = list(resp.get("alternative_perspectives") or [])
         for concern in (resp.get("concerns_per_pick") or []):
             sym = concern.get("symbol")
@@ -114,7 +114,7 @@ def write_council_files(
     return written
 
 
-# ── Markdown rendering ───────────────────────────────────────────────────────
+# -- Markdown rendering -------------------------------------------------------
 
 def _render_one(
     *,
@@ -132,13 +132,13 @@ def _render_one(
     is_rejected_pile_question: bool,
 ) -> str:
     lines: list[str] = []
-    lines.append(f"# Council deliberation — {sym} — {date_str}")
+    lines.append(f"# Council deliberation - {sym} - {date_str}")
     lines.append("")
 
     if is_rejected_pile_question:
         lines.append("> **Note**: this symbol was NOT in the primary author's picks. "
                      "It surfaced because at least one reviewer raised it as a "
-                     "rejected_pile_question — see Round 2 below.")
+                     "rejected_pile_question - see Round 2 below.")
         lines.append("")
 
     if trace.aborted:
@@ -147,36 +147,36 @@ def _render_one(
         lines.append("> Original synthesis preserved; no revision applied.")
         lines.append("")
 
-    # ── Verdict ──────────────────────────────────────────────────────────
+    # -- Verdict ----------------------------------------------------------
     lines.append("## Verdict")
     lines.append("")
     if tier_change:
-        lines.append(f"- **Tier change**: `{tier_change['before']}` → `{tier_change['after']}`")
+        lines.append(f"- **Tier change**: `{tier_change['before']}` -> `{tier_change['after']}`")
     elif original_pick:
         lines.append(f"- **Tier (unchanged)**: `{original_pick.get('tier', '?')}`")
     elif is_rejected_pile_question:
         lines.append(f"- **Origin**: rejected-pile-question (not a pick)")
     if alloc_change:
-        lines.append(f"- **Allocation change**: {alloc_change['before_pct']}% → {alloc_change['after_pct']}%")
+        lines.append(f"- **Allocation change**: {alloc_change['before_pct']}% -> {alloc_change['after_pct']}%")
     elif original_pick and original_pick.get("suggested_allocation_pct") is not None:
         lines.append(f"- **Allocation (unchanged)**: {original_pick.get('suggested_allocation_pct')}%")
     lines.append("")
 
-    # ── Reviewer pressure summary ────────────────────────────────────────
+    # -- Reviewer pressure summary ----------------------------------------
     lines.append("## Reviewer pressure")
     lines.append("")
     lines.append("| Voice | Consensus pressure | Concerns | Rejected-pile questions |")
     lines.append("|-------|--------------------|----------|-------------------------|")
     for voice_name in voice_pressure:
-        pressure = voice_pressure.get(voice_name, "—")
+        pressure = voice_pressure.get(voice_name, "-")
         n_concerns = len(voice_concerns.get(voice_name, {}).get(sym, []))
         n_rqs = len(voice_rej_questions.get(voice_name, {}).get(sym, []))
         lines.append(f"| {voice_name} | {pressure} | {n_concerns} | {n_rqs} |")
     lines.append("")
 
-    # ── Original Opus R1 verdict (only if this was a pick) ───────────────
+    # -- Original Opus R1 verdict (only if this was a pick) ---------------
     if original_pick:
-        lines.append("## Round 1 — primary author (Claude Opus)")
+        lines.append("## Round 1 - primary author (Claude Opus)")
         lines.append("")
         lines.append(f"- **Tier**: {original_pick.get('tier', '?')}  "
                      f"**Conviction**: {original_pick.get('conviction', '?')}  "
@@ -194,8 +194,8 @@ def _render_one(
             lines.append(f"> {tier_reasoning}")
             lines.append("")
 
-    # ── Reviewer critiques per voice ─────────────────────────────────────
-    lines.append("## Round 2 — reviewer critiques")
+    # -- Reviewer critiques per voice -------------------------------------
+    lines.append("## Round 2 - reviewer critiques")
     lines.append("")
     for voice_name in voice_pressure:
         lines.append(f"### {voice_name}")
@@ -223,9 +223,9 @@ def _render_one(
                 lines.append(f"- {q.get('challenge', '(no challenge text)')}")
             lines.append("")
 
-    # ── Revised verdict (R3 Opus) ────────────────────────────────────────
+    # -- Revised verdict (R3 Opus) ----------------------------------------
     if not trace.aborted and revised_pick:
-        lines.append("## Round 3 — primary author revision")
+        lines.append("## Round 3 - primary author revision")
         lines.append("")
         lines.append(f"- **Tier**: {revised_pick.get('tier', '?')}  "
                      f"**Conviction**: {revised_pick.get('conviction', '?')}  "
@@ -238,22 +238,22 @@ def _render_one(
             lines.append(f"> {revised_reasoning}")
             lines.append("")
     elif not trace.aborted and not revised_pick and is_rejected_pile_question:
-        # Symbol was in rejected pile and stayed there — find R3's rejected entry to show its updated tier_reasoning
-        lines.append("## Round 3 — primary author revision")
+        # Symbol was in rejected pile and stayed there - find R3's rejected entry to show its updated tier_reasoning
+        lines.append("## Round 3 - primary author revision")
         lines.append("")
         lines.append("_Symbol stayed in the rejected pile. The reviewer's challenge above is what surfaced "
                      "this engram; if the primary author updated the rejection's tier_reasoning to address "
                      "the challenge, that text is in the run record (state/synthesis/...) under the symbol's "
-                     "rejected entry — not duplicated here to keep the council file focused on the "
+                     "rejected entry - not duplicated here to keep the council file focused on the "
                      "deliberation rather than the persistent rejection rationale._")
         lines.append("")
     elif not trace.aborted and not revised_pick:
-        lines.append("## Round 3 — primary author revision")
+        lines.append("## Round 3 - primary author revision")
         lines.append("")
         lines.append("_Symbol moved from picks to rejected pile (or dropped entirely)._")
         lines.append("")
 
-    # ── Council metadata footer ──────────────────────────────────────────
+    # -- Council metadata footer ------------------------------------------
     lines.append("## Council metadata")
     lines.append("")
     lines.append(f"- Triggered: {trace.triggered_at}")

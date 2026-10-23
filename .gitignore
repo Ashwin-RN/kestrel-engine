@@ -31,3 +31,9 @@ Thumbs.db
 state/
 storage/
 vault/
+
+# Validation ledger and other local databases (never published)
+*.db
+*.sqlite
+*.sqlite3
+journal/

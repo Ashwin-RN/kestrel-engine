@@ -1,9 +1,8 @@
-"""Talon — order placement + safety layer.
+"""Talon: order placement plus the safety layer.
 
-Component 10 of the Kestrel Engine (Phase 4: Physical Layer). Routes split
-tranches into the broker's API with pre-attached safety. Limit orders only,
-paper-by-default. Honours core.config.LIVE_TRADING_ENABLED.
-
-V1 ships with paper mode default. Flip KESTREL_LIVE_TRADING=true after 2
-weeks of paper observation per BACKLOG go-live discipline.
+The controlled edge between internal intent and the broker. Limit orders only,
+paper by default, a master kill switch for live placement, an operator-approved
+list that gates new capital (and never exits), fire-time cash and fill gates, a
+duplicate-order defence backed by both the ledger and broker truth, and
+reconciliation that surfaces drift instead of correcting it.
 """
