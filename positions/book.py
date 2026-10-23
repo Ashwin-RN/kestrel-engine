@@ -16,7 +16,7 @@ Schema:
           "time_stop": "YYYY-MM-DD",
           "source_run": "<synth-run-id>",
           "tier_at_entry": "A",
-          "macro_regime_at_entry": "SYSTEMIC_DISCOUNT",
+          "macro_regime_at_entry": "DRIFT",
           "macro_severity_at_entry": 0,
           "thesis_summary": "...",
           "opened_at": "...",

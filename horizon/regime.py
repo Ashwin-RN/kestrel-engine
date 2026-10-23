@@ -52,6 +52,11 @@ MACRO_DIR = config.STATE_DIR / "macro"
 SUBAGENT_NAME = "horizon-macro-classifier"
 SUBAGENT_TIMEOUT_S = 60
 
+# When the tripwire fires but the classifier fails, production assumes a
+# conservative non-zero severity rather than a quiet day. That fallback level is
+# part of the macro ladder and is withheld from the public edition.
+_CLASSIFIER_FAILURE_SEVERITY: Optional[int] = None
+
 # ── Cap-band benchmark mapping ────────────────────────────────────────────
 
 # Realistic Indian-market cap bands (INR).
@@ -194,7 +199,7 @@ def tripwire_fired(
 @dataclass
 class MacroState:
     as_of: str                           # ISO date
-    regime: str = "DRIFT"                # DRIFT / SYSTEMIC_DISCOUNT / HOLD / EXIT_AND_WAIT / CRISIS
+    regime: str = "DRIFT"                # DRIFT (quiet) up to CRISIS; the ladder is withheld
     severity: int = 0                    # 0 (quiet) to 10 (crisis)
     event_type: str = "NONE"             # GEO_POLITICAL / DOMESTIC_POLICY / MACRO_ECON / UNCLEAR / NONE
     root_cause: str = ""
@@ -209,10 +214,10 @@ class MacroState:
 
 
 def _severity_to_regime(severity: int) -> str:
-    """Map a 0-10 macro severity to a regime label
-    (DRIFT / SYSTEMIC_DISCOUNT / HOLD / EXIT_AND_WAIT / CRISIS). The cutoffs that
-    define each band are a tuned risk ladder and are withheld from the public
-    edition; this returns the quiet-state label."""
+    """Map a 0-10 macro severity to a regime label, from DRIFT (quiet) up to
+    CRISIS. The intermediate labels and the cutoffs that define each band are a
+    tuned risk ladder and are withheld from the public edition; this returns the
+    quiet-state label."""
     return "DRIFT"
 
 
@@ -387,10 +392,16 @@ def compute_today(
             root_cause = str(out.get("root_cause", "") or "")
             actionable = str(out.get("actionable_insight", "") or "")
         except Exception as e:
-            log.warning("macro classifier failed: %s — falling back to severity 3 UNCLEAR", e)
-            severity = 3
+            if _CLASSIFIER_FAILURE_SEVERITY is None:
+                log.warning("macro classifier failed: %s; the conservative fallback severity "
+                            "is withheld from the public edition, applying 0", e)
+                severity = 0
+                root_cause = "tripwire fired but classifier failed; fallback severity withheld, 0 applied"
+            else:
+                log.warning("macro classifier failed: %s; applying the conservative fallback", e)
+                severity = _CLASSIFIER_FAILURE_SEVERITY
+                root_cause = "tripwire fired but classifier failed; conservative fallback applied"
             event_type = "UNCLEAR"
-            root_cause = "tripwire fired but classifier failed; assuming systemic discount"
 
     # Hysteresis
     prev_state = load_latest_state()

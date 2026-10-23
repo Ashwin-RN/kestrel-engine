@@ -5,10 +5,11 @@ mathematically still, watches the ground below, and dives at the exact moment.
 That is the design ethos. Patience in chaos, deterministic timing, surgical
 action.
 
-This document names the 13 functional components of the engine, the role each
-plays, the AI agents some of them own, and the failure modes worth watching. The
-vocabulary is deliberately distinct from file paths, so logs and conversation can
-say "Fulcrum's macro filter is too tight" instead of naming a module.
+This document names the engine's fourteen named components (thirteen numbered
+slots, with Apex as 9b), the role each plays, the AI agents some of them own,
+and the failure modes worth watching. The vocabulary is deliberately
+distinct from file paths, so logs and conversation can say "Fulcrum's trend
+filter is too tight" instead of naming a module.
 
 The spine of the system is a single rule: **language models do the judgment,
 deterministic code holds the veto.** Models research, diagnose, rank, and
@@ -24,7 +25,9 @@ decision thresholds, scoring weights, allocation tables, the sub-sector
 cyclicality model, universe inclusion rules, agent prompt contracts, internal
 schemas, live positions, fills, PnL, account data, environment variables, state
 paths, run commands, and operational runbooks. Where a public code file keeps its
-structure, the calibrated numbers have been withheld.
+structure, the calibrated numbers have been withheld. Several published code
+files sit at an earlier snapshot of the system; this document describes the live
+shape, and the code is refreshed in planned passes.
 
 ## Theme: a cybernetic predator
 
@@ -48,7 +51,7 @@ flowchart LR
     G --> H[Execution boundary]
     H --> I[Audit ledger]
     I --> J[Long-term memory]
-    J --> D
+    J -. planned read-back .-> D
     K[Exit monitor] --> H
     L[Operations control plane] --> B
     L --> F
@@ -70,20 +73,27 @@ quality names in deep drawdown that are worth deeper research.
 - **Outputs**: a ranked, reproducible candidate set with price, 52-week high, and
   sector.
 - **Public-safe note**: universe maintenance is separated from per-run screening,
-  and the scan is rerunnable, cacheable, and auditable. The inclusion rules,
-  drawdown band, and rejected buckets are withheld.
+  and the scan is rerunnable, cacheable, and auditable. A fresh structural break
+  (a demerger, a rebase) is taken out of the band before any model sees the
+  name; a held name goes to review instead. The inclusion rules, drawdown band,
+  and rejected buckets are withheld.
 - **Failure modes**: stale universe list, split or dividend artifacts in price
-  history, mis-tagged sub-sector taxonomy.
+  history (mitigated by a splice guard that re-fetches history on a close
+  mismatch), mis-tagged sub-sector taxonomy.
 
 ### 2. Pulse
 The peripheral nervous system. Turns noisy corporate and market information into
 structured evidence: filings, news, sub-sector context, and sentiment.
 
-- **Agents**: a sub-sector outlook agent (recovery thesis per sub-sector).
+- **Agents**: a weekly two-step sector thesis. A research agent gathers cited
+  evidence from the web, code checks the citations, then a verdict agent that
+  cannot search judges whether each sector's fall is temporary, cyclical or
+  structural.
 - **Inputs**: corporate announcements, news, a FinBERT sentiment pipeline, sector
   context.
 - **Outputs**: tagged filings, a sentiment volumetric (positive/negative/neutral
-  counts and trend), and a per-sector outlook with an expected horizon.
+  counts and trend), and a per-sector thesis with an expected horizon that the
+  diagnosis stage reads.
 - **Failure modes**: news-result drift across calls, source timeouts, filing
   keyword rules missing a new event type. A per-day cache stabilizes repeat runs.
 
@@ -95,7 +105,8 @@ computed as pure math with no LLM, hot-path safe.
 - **Inputs**: a candle DataFrame, optional 52-week high, current price.
 - **Outputs**: a structured technicals block (momentum, moving averages,
   volatility, support and resistance, anchored VWAP, volume profile, a phase
-  label, and a knife-risk score).
+  label, and a knife-risk score), and the entry geometry: a deterministic price
+  band anchored to the recent low, with both bounds.
 - **Public-safe note**: this owns technical feature generation as structured data
   rather than mixing it into prompts. The indicator periods are textbook; the
   composite weights and rule boundaries are withheld.
@@ -115,6 +126,10 @@ is supportive, discounted, stressed, or in crisis.
 - **Public-safe note**: the design keeps a quantitative pre-filter in front of the
   LLM so tokens are spent only on genuine events. The tripwire levels and severity
   cutoffs are withheld.
+- **Where it binds**: only at the daily entry gate. The weekly research run
+  records the regime beside its output but never lets one day's read reshape the
+  roster, and the operator can override the read with a logged note. Macro
+  blocks entries; it never liquidates.
 - **Failure modes**: beta instability across regimes, low-volatility false wakes,
   cap-band mis-mapping after a large drawdown.
 
@@ -133,6 +148,8 @@ strong enough to deserve attention?
 - **Inputs**: a fundamentals snapshot, a peer set, sector context from Pulse.
 - **Outputs**: a relative-strength verdict, the peer set, and a structured
   scorecard.
+- **Public-safe note**: the peer set is chosen deterministically by market-cap
+  proximity, and a thin cohort abstains rather than decides.
 - **Failure modes**: peer-set mis-selection, missing fundamentals, run-to-run
   variance. A per-day cache eliminates same-day variance.
 
@@ -140,8 +157,11 @@ strong enough to deserve attention?
 The autopsy. Diagnoses why a stock fell: a systemic shock, localized decay, or a
 benign cause. Separates recoverable dislocation from permanent impairment.
 
-- **Agents**: a news-diagnosis agent.
-- **Inputs**: filings and sentiment from Pulse, peer drawdowns from Nucleus.
+- **Agents**: a news-diagnosis agent that reads the week's sector thesis and rules
+  whether the fall is sector, market or company level. Its inputs are
+  snapshotted and replayable.
+- **Inputs**: filings and sentiment from Pulse, the sector thesis, peer drawdowns
+  from Nucleus.
 - **Outputs**: a fall-cause classification (company-specific, sector-wide, or
   mixed), a severity score, a confidence, and a structured thesis.
 - **Failure modes**: severity inflation on opaque corporate actions, false
@@ -152,27 +172,37 @@ The frontal lobe. The master reasoning layer that ingests everything upstream an
 produces a ranked decision set with reasons, risks, and rejections.
 
 - **Agents**: a portfolio synthesizer (Anthropic Opus). The Council adds two
-  independent critics.
-- **Inputs**: per-stock dossiers, portfolio constraints, and macro state.
-- **Outputs**: ranked picks, a rejected pile with reasoning, portfolio notes, and
-  structured entry triggers.
+  critic seats and an arbiter.
+- **Inputs**: per-stock dossiers with the technicals stripped out, and portfolio
+  constraints. The macro read is recorded beside the run, not fed to the model.
+- **Outputs**: ranked picks (tier and conviction), a rejected pile with
+  reasoning, and portfolio notes. Entry levels are attached afterwards from
+  deterministic geometry, not written by the model.
 - **Public-safe note**: Cortex combines deterministic gates with model-assisted
   review and keeps arithmetic, thresholds, and validation outside free-form model
   text. The gate list, tier rules, and expected-value formulas are withheld.
 
-**The Council.** A primary author (Opus) emits the ranked view. Two reviewers,
-Google Gemini and OpenAI Codex, receive that output plus the original dossiers and
-emit structured critiques in parallel. The author then revises in the same JSON
-contract. Any voice can fail (timeout, malformed output) and the run degrades
-gracefully: a surviving reviewer still drives a revision, and if all critics fail
-the original synthesis is the fallback. The full deliberation is persisted for
-audit.
+**The Council.** A primary author (Opus) emits the ranked view. Two critic seats,
+OpenAI Codex and Claude (with a third model as a fallback seat), receive that
+output plus the original dossiers; each does a blind read, then a critique, in
+parallel. An Opus arbiter rules on each finding (accept, partial, reject or
+unresolved), and code applies the rulings: a name moves one step at most, never
+above its gate ceiling, never when it is already held, and every accepted
+downgrade becomes a verify-before-approval flag. The council warns about what it
+changed and never hides it. One critic can fail (timeout, malformed output) and
+the batch proceeds degraded and uncached; if the arbiter or both critics fail,
+the run refuses to persist rather than ship an unreviewed synthesis. The full
+deliberation is persisted for audit. The published `cortex/council.py` shows the
+first contract (two critics, author revision); the arbiter contract's modules are
+not public.
 
 **Deterministic tier validation.** A reproducibility test showed the LLM would
-occasionally assign a tier its own inputs did not support. A post-LLM validator
-re-checks the structural tier criteria in code and downgrades any pick that does
-not satisfy them, annotating the audit trail. The model stays in charge of
-narrative, sizing, and prices; the structural tier decision is code-bound.
+occasionally assign a tier its own inputs did not support. A gate stack sets a
+ceiling on every name; the model's tier is clamped to it, and the ceiling is a
+maximum, never an assignment. A post-LLM validator re-checks the structural tier
+criteria in code and downgrades any pick that does not satisfy them, annotating
+the audit trail. The model stays in charge of narrative, tier and conviction;
+sizing belongs to Zenith and prices to the deterministic geometry.
 
 ---
 
@@ -186,19 +216,26 @@ The pivot. An anti-falling-knife state machine that waits for selling pressure t
 exhaust and a reversal to confirm before a candidate can move toward execution.
 
 States: IDLE to IN_ZONE to EXHAUSTING to REVERSAL_CONFIRMED, with an INVALIDATED
-edge from any state.
+edge from any state. Two machines run side by side, chosen per entry profile:
+the legacy machine above, and a campaign machine (PENDING, ARMED, CHASE_LOCKED,
+then FIRED, INVALIDATED or EXPIRED) that places staged legs.
 
-- **Agents**: a falling-knife interpreter that translates pre-computed technicals
-  into structured entry and invalidation triggers. The math lives in Vector; the
-  watcher evaluates the triggers mechanically against live ticks.
+- **Agents**: none on the live path. Entry levels come from deterministic
+  geometry (Vector); an LLM interpreter that translated technicals into triggers
+  remains only as a declared rollback. The watcher evaluates the levels
+  mechanically against live ticks.
 - **Inputs**: live ticks, current picks from Cortex, technicals refreshed at
-  startup, macro severity, circuit limits, and a news-blackout window.
-- **Outputs**: persisted state transitions and tranche signals.
+  startup, macro severity, circuit limits, and a news blackout around result
+  filings that fails closed: an unreadable feed blocks the name.
+- **Outputs**: persisted state transitions, fire records, and a logged refusal
+  for every gate that blocked a fire.
 - **Public-safe note**: this is a timing layer, not a thesis generator. It
-  separates research conviction from execution timing. The confirmation rules and
-  thresholds are withheld.
-- **Failure modes**: the macro filter is tight for fallen angels by construction,
-  divergence false positives in chop, feed disconnects.
+  separates research conviction from execution timing. The published legacy
+  machine shows the rule structure; the calibrated thresholds are withheld, and
+  the campaign machine is not published.
+- **Failure modes**: a per-stock trend filter is tight for fallen angels by
+  construction, so it runs in shadow and is measured rather than enforced;
+  divergence false positives in chop; feed disconnects.
 
 ### 9. Zenith
 The portfolio brain. A fully deterministic position sizer and risk-gate enforcer
@@ -212,25 +249,30 @@ levels, under capital and concentration constraints.
 - **Outputs**: an execution plan (latest plus a dated archive) with per-pick
   intents and risk-gate results.
 - **Public-safe note**: Zenith centralizes sizing, exposure, and risk policy. The
-  allocation table, capital caps, and position limits are withheld.
+  weekend research run writes only a preview plan; the live plan has exactly one
+  writer, rebuilt each morning from the operator-approved names and the held
+  book, with a verified record of what was promoted. The allocation table,
+  capital caps, and position limits are withheld.
 
 ### 9b. Apex
 The peak. The exit-side mirror of Fulcrum, split out of Zenith into its own
 component. Fulcrum waits for selling to exhaust and a reversal up, then buys; Apex
-waits for recovery demand to exhaust and a roll-over, then signals a sell.
+waits for recovery demand to exhaust and a roll-over, then sells. It is
+take-profit only and by construction never sells at or below entry.
 
 States: HOLDING to VIGILANT to ARMED to EXHAUSTION_CONFIRMED to EXIT_FIRING to
 EXTRACTED, with an INVALIDATED back-edge.
 
 - **Agents**: none (deterministic).
 - **Public-safe note**: Apex mirrors entry discipline on the exit side. It can run
-  as an advisory or as an automation boundary depending on configuration. Its
-  trigger formulas, automation flags, and shadow-versus-live behavior are
-  withheld. In the default posture the engine performs no destructive automation:
-  exits surface as operator alerts.
+  as an advisory or as an automation boundary depending on configuration, and
+  its trigger formulas and automation flags are withheld. The exit posture is
+  asymmetric by design: the loss side is alert-only (the stop and the
+  checkpoints raise alerts and the operator sells by hand), while this
+  take-profit machine can be armed to sell.
 - **Failure modes**: trailing too tight in early recovery, and a daily-bar cadence
-  that lags a fast intraday distribution (the intended fix is an executed-volume
-  signal at tick cadence).
+  that lags a fast intraday distribution (the price floor is already watched
+  intraday; the executed-volume signal at tick cadence is the open upgrade).
 
 ---
 
@@ -249,8 +291,11 @@ orders only, paper by default.
 - **Public-safe note**: Talon enforces safety checks before anything leaves the
   engine and records intent before execution, so a crash mid-order leaves an
   auditable trail. It is built around idempotency, reconciliation, and fail-loud
-  visibility. A live-symbol whitelist and a master kill-switch gate live orders.
-  Order tags, retry rules, and provider-specific handling are withheld.
+  visibility. New capital goes only to names the operator explicitly approved
+  after review, and that list prunes itself when a name exits; exits are never
+  gated by it. At fire time a cash gate, a minimum order size and a minimum fill
+  fraction each refuse with a logged reason, and a master kill switch gates live
+  orders. Retry rules and provider-specific handling are withheld.
 - **Failure modes**: partial fills, broker rejection codes, double-record on a
   mid-call crash (addressed by idempotent records).
 
@@ -266,6 +311,11 @@ and what the system actually did.
 - **Failure modes**: drift versus broker holdings (surfaced, operator-resolved),
   manual-edit corruption, partial fills mis-recorded.
 
+**Validation ledger.** Beside the position record, a validation ledger grades
+every weekly cohort at fixed horizons against questions the operator
+pre-registered before any outcome resolved. It is advisory and never gates a
+run; capital moves to the next rung only when those pre-registered bars are met.
+
 ### 12. Engram
 The neural memory trace. A per-symbol markdown dossier that accumulates what the
 system knew about a name across runs, what it decided, and how it played out, plus
@@ -273,8 +323,10 @@ an append-only refresh log.
 
 - **Agents**: none today; a future compression agent.
 - **Public-safe note**: Engram preserves research context and decision provenance
-  so the engine does not restart from zero each run, and so it can learn from its
-  own prior work. The dossiers themselves, tied to real names, are not public.
+  for the operator, including a hand-written log carried verbatim across every
+  regeneration. Feeding it back into the analysis stages is open work (the dotted
+  edge in the flow above). The dossiers themselves, tied to real names, are not
+  public.
 - **Failure modes**: growth without compression, stale frontmatter after a
   demote-then-repromote.
 
@@ -283,10 +335,13 @@ The brainstem. The control plane that turns a collection of modules into an
 operated system: preflight checks, validation gates, operator workflows, and
 observability.
 
-- **Agents**: a one-shot taxonomy-maintenance agent.
+- **Agents**: a taxonomy auditor, and an assigner-reviewer pair (Opus assigns,
+  Codex reviews) for bucketing new listings.
 - **Public-safe note**: Kernel runs validation gates before downstream actions are
-  allowed and provides repeatable run rituals. The commands, schedules,
-  notification channels, and runbooks are withheld.
+  allowed and provides repeatable run rituals. Every gate resolves into one
+  fingerprinted manifest, and preflight fails if the armed set drifts from the
+  declared one in either direction. The commands, schedules, notification
+  channels, and runbooks are withheld.
 - **Failure modes**: the runbook drifting behind code, a missing check for a
   recently added component.
 
@@ -296,15 +351,20 @@ observability.
 
 - Python for analytics and orchestration.
 - Tabular and columnar data processing.
-- A multi-provider LLM adapter (Anthropic, Google Gemini, OpenAI Codex) with a
-  transparent fallback ladder and telemetry, plus a local fallback for offline
-  use.
+- A multi-provider LLM adapter: Anthropic via API and the Claude CLI, the OpenAI
+  Codex CLI, OpenRouter for GLM, and Google Gemini as a fallback tier, with a
+  declared ladder, per-call provenance stamps, and agent processes isolated from
+  the repository's operator notes. A local model adapter is kept for offline
+  experiments, off the live path.
 - Deterministic rule engines for gates, risk checks, sizing, and validation.
 - FinBERT for news sentiment.
 - Schema validation and contract-style tests around artifacts that cross module
   boundaries.
 - Audit-first state: decisions, intents, outcomes, and reviews are durable
-  artifacts.
+  artifacts, plus a SQLite validation ledger.
+- Filing enrichment: PDF text extraction with an OCR fallback.
+- Test belts that block paid model calls and real model CLIs from the test
+  suite.
 - Cloud-ready separation between core logic, adapters, operations, and runtime
   state.
 

@@ -1,6 +1,13 @@
-"""Cortex Council — Option B orchestrator (primary author + reviewers).
+"""Cortex Council: the first council contract (primary author + reviewers).
 
-Architecture (locked 2026-05-15):
+PUBLIC EDITION NOTE: this module shows the council's first contract, in which
+two critics review the author's synthesis and the author revises. The live
+contract today keeps two critic seats (OpenAI Codex and Claude, with a third
+model as a fallback seat) and adds an arbiter that rules on each finding;
+code applies the rulings, warns, and never hides a change. That contract is
+described in ARCHITECTURE.md; its modules are not part of this public subset.
+
+Architecture of the first contract (2026-05-15):
 
     Round 1 (R1):  Claude Opus emits the primary synthesis.
                    This is the existing single-agent stage5_synthesis path —
@@ -32,11 +39,9 @@ Failure modes (graceful degradation):
   with `aborted: True` flagged. The single-agent output is the fallback.
 - Opus revision fails → council aborts the same way.
 
-The strategic-scope contract: this is for 6-18mo mean reversion. Critic
-prompts are explicitly calibrated to that window (see
-cortex/council_critic_prompt.py). DCF and moat-style critiques don't fit
-here; reviewers are instructed to focus on catalyst timing, survival,
-and forced-seller dynamics.
+The strategic-scope contract: this is for 6-18mo mean reversion. The critic
+prompts are calibrated to that window and are withheld from the public
+edition (cortex/council_critic_prompt.py is not shipped).
 """
 
 from __future__ import annotations
@@ -49,8 +54,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from core import config
-from cortex.council_critic_prompt import (
+from cortex.council_critic_prompt import (   # withheld module: the prompts are the edge
     CRITIC_SYSTEM_PROMPT,
+    REVISION_INSTRUCTIONS,
     build_critic_user_prompt,
 )
 from data.llm import CodexCLI, GeminiLLM, invoke_subagent
@@ -159,12 +165,10 @@ def run_council(
         "REVIEWER_CRITIQUES": {
             v.agent: v.raw_response for v in surviving
         },
-        "REVISION_INSTRUCTIONS": (
-            "You previously emitted ORIGINAL_SYNTHESIS for ORIGINAL_INPUT. "
-            "Two peer reviewers have critiqued it (REVIEWER_CRITIQUES). "
-            "Re-evaluate per the Round 3 rules in your system prompt. "
-            "Output the REVISED synthesis in the same JSON contract."
-        ),
+        # The revision instruction text is prompt material and is withheld from
+        # the public edition; the name is imported from the unshipped prompt
+        # module so the structure stays readable.
+        "REVISION_INSTRUCTIONS": REVISION_INSTRUCTIONS,
     }
 
     t_rev = time.time()

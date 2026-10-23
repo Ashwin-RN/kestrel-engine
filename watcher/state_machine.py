@@ -5,7 +5,7 @@ State lifecycle (per spec):
 
     IDLE  ─enters buy_zone + macro filter passes──►  IN_ZONE
     IN_ZONE  ─exhaustion signals on 15m/1H──►  EXHAUSTING
-    EXHAUSTING  ─CHoCH + 2× vol + index confluence──►  REVERSAL_CONFIRMED
+    EXHAUSTING  ─CHoCH + volume surge + index confluence──►  REVERSAL_CONFIRMED
     *any*  ─gap-down / circuit / inval-close──►  INVALIDATED
 
 This module is **pure logic** — no broker, no ticker. The watcher loop drives

@@ -2,8 +2,8 @@
 Safety primitives — invoked at watcher startup and on every order-placement
 path. Refuses to proceed when configuration looks inconsistent; surfaces
 drift between Kestrel's position book and the broker's actual holdings; and
-implements the macro CRISIS kill switch (severity 10 broadcast → emergency
-exit all open positions).
+implements the emergency exit behind the operator's panic command. The macro
+gate blocks entries and never liquidates.
 
 Design rule: nothing here should fail silently. A safety check that fails
 must log loudly AND prevent the next action.
@@ -152,11 +152,11 @@ def reconcile_holdings(broker) -> ReconciliationReport:
     return rpt
 
 
-# ── Emergency exit (CRISIS kill switch) ───────────────────────────────────
+# ── Emergency exit (operator panic command) ───────────────────────────────
 
 def emergency_exit_all(broker, *, reason: str = "MANUAL_EXIT") -> list[dict]:
-    """Iterate every open position and fire a market-priced exit. Used by
-    the macro severity-10 broadcast and by manual `python -m talon panic`.
+    """Iterate every open position and fire a market-priced exit. Called only
+    by the operator's panic command, which asks for confirmation in live mode.
 
     Uses current LTP for limit price. Returns list of summary dicts.
     """

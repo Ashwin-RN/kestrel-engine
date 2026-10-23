@@ -4,11 +4,10 @@ NSE calendar + IST clock.
 All datetimes in Kestrel are timezone-aware IST. `now()` is the only call site
 for "current time" — monkey-patch it in tests to freeze the clock.
 
-Holiday support is intentionally minimal: weekday-only trading-day check.
-Live execution relies on the broker to reject orders on holidays; backtest
-uses CSV data that only contains actual trading days. When exact holiday
-handling is needed (e.g. holiday-adjusted monthly expiry), extend the
-`NSE_HOLIDAYS` set below.
+Holiday support: a weekday check against the `NSE_HOLIDAYS` set below. Live
+execution also relies on the broker to reject orders on a closed day, so a
+missing entry is tolerable live and wrong only for calendar arithmetic such as
+the holiday-adjusted monthly expiry.
 """
 
 from datetime import date, datetime, time, timedelta
@@ -22,7 +21,7 @@ MARKET_CLOSE = time(15, 30)
 
 # Known NSE holidays (published circulars). Extend as needed.
 # Missing a holiday here means a non-trading day is incorrectly treated as
-# a trading day — tolerable for live (broker rejects), lossy for backtest.
+# a trading day: tolerable live (the broker rejects), wrong for calendar math.
 NSE_HOLIDAYS: frozenset[date] = frozenset({
     # 2024
     date(2024, 1, 26),   # Republic Day
@@ -54,9 +53,24 @@ NSE_HOLIDAYS: frozenset[date] = frozenset({
     date(2025, 10, 22),  # Balipratipada
     date(2025, 11, 5),   # Gurunanak Jayanti
     date(2025, 12, 25),  # Christmas
-    # 2026 (partial — verify against NSE circular when published)
+    # 2026, equity-segment weekday closures per the NSE holiday circular.
+    # Holidays that fall on a weekend need no entry.
+    date(2026, 1, 15),   # Maharashtra municipal elections (special closure)
     date(2026, 1, 26),   # Republic Day
-    date(2026, 3, 4),    # Holi (placeholder — verify)
+    date(2026, 3, 3),    # Holi
+    date(2026, 3, 26),   # Shri Ram Navami
+    date(2026, 3, 31),   # Shri Mahavir Jayanti
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 5, 28),   # Bakri Id
+    date(2026, 6, 26),   # Muharram
+    date(2026, 9, 14),   # Ganesh Chaturthi
+    date(2026, 10, 2),   # Mahatma Gandhi Jayanti
+    date(2026, 10, 20),  # Dussehra
+    date(2026, 11, 10),  # Diwali Balipratipada
+    date(2026, 11, 24),  # Prakash Gurpurb Sri Guru Nanak Dev
+    date(2026, 12, 25),  # Christmas
 })
 
 
@@ -132,9 +146,3 @@ def monthly_expiry(year: int, month: int) -> date:
 
 def is_monthly_expiry(d: date) -> bool:
     return d == monthly_expiry(d.year, d.month)
-
-
-def previous_day_was_monthly_expiry(d: Optional[date] = None) -> bool:
-    """True if the previous trading day was the monthly expiry (the PME gate)."""
-    d = d or today()
-    return is_monthly_expiry(previous_trading_day(d))

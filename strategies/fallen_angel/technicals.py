@@ -4,16 +4,17 @@ Technical-analysis calculator. Pure math, no LLM, deterministic.
 Given a candle DataFrame (with columns: date, open, high, low, close, volume),
 plus optional 52W high and current price overrides, this module returns a
 structured `Technicals` dict consumed by:
-  - the fa-falling-knife agent (which interprets the numbers with news context)
-  - the live tick watcher (which evaluates LLM-set entry triggers against
-    these metrics in milliseconds)
+  - the deterministic entry-geometry step (which sets the entry levels; an LLM
+    interpreter remains only as a declared rollback)
+  - the live tick watcher (which evaluates the entry triggers against these
+    metrics in milliseconds)
 
 Outputs are intentionally exhaustive — every signal the watcher might need to
 evaluate is precomputed here so the hot path stays LLM-free.
 
-Phase and knife_risk are rule-based composites. The agent layer may override
-them when news/sector context contradicts the math (e.g. corp-action artifact
-bounces that look BOUNCING numerically but should be ignored).
+Phase and knife_risk are rule-based composites. Downstream review may dispute
+them when news or sector context contradicts the math (e.g. corp-action
+artifact bounces that look BOUNCING numerically but should be ignored).
 """
 
 from __future__ import annotations
@@ -26,6 +27,11 @@ import numpy as np
 import pandas as pd
 
 log = logging.getLogger("vector.technicals")
+
+# The RSI bands that feed the phase rule are tuned and withheld from the public
+# edition; the derived signals read None when the bands are not supplied.
+_RSI_STRONG_ABOVE: Optional[float] = None
+_RSI_WEAK_BELOW: Optional[float] = None
 
 
 # ── Indicators ─────────────────────────────────────────────────────────────
@@ -374,8 +380,10 @@ def classify_phase(
     hl = seq.get("consecutive_higher_lows", 0)
     ll = seq.get("consecutive_lower_lows", 0)
     ma_aligned_up = (ma_20 is not None and ma_50 is not None and ma_20 > ma_50)
-    rsi_strong = (rsi_14 is not None and rsi_14 > 50)
-    rsi_weak = (rsi_14 is not None and rsi_14 < 45)
+    rsi_strong = ((rsi_14 > _RSI_STRONG_ABOVE)
+                  if (rsi_14 is not None and _RSI_STRONG_ABOVE is not None) else None)
+    rsi_weak = ((rsi_14 < _RSI_WEAK_BELOW)
+                if (rsi_14 is not None and _RSI_WEAK_BELOW is not None) else None)
 
     signals = {
         "close_vs_5d_high_pct": round(close_vs_5d_high, 4),
@@ -409,8 +417,8 @@ def knife_risk(
 ) -> tuple[int, dict]:
     """Composite knife risk 1..5. Higher = still falling, lower = stabilized.
 
-    The weights are explicit and exposed in the signal block so an LLM
-    reviewer can dispute the score.
+    The component inputs are exposed in the signal block so a reviewer can
+    dispute the score; the weights themselves are withheld in this edition.
     """
     if closes.empty or len(closes) < 10:
         return 3, {"note": "insufficient data, defaulted to 3"}
@@ -431,11 +439,11 @@ def knife_risk(
     }
 
     # Scoring withheld from the public edition. The production version assigns
-    # tuned +/-1 weights to each component above (recent change, down-day count,
-    # up/down volume ratio, MA-50 slope, time since the 52-week low) and clamps
-    # the sum to a 1..5 score with 3 as neutral. Those weights are part of the
+    # tuned weights to each component above (recent change, down-day count,
+    # up/down volume ratio, MA-50 slope, time since the 52-week low) and maps
+    # the result onto the 1..5 scale. The weights and the bounds are part of the
     # edge and are not published. The inputs the score considers are shown; the
-    # public edition returns the neutral midpoint so the structure stays exercisable.
+    # public edition returns the scale's midpoint so the structure stays exercisable.
     components["note"] = "knife-risk component weights withheld from the public edition"
     return 3, components
 

@@ -62,7 +62,7 @@ class Order:
     product: Product = Product.CNC
     price: Optional[float] = None           # For LIMIT / SL
     trigger_price: Optional[float] = None   # For SL / SL-M
-    tag: Optional[str] = None               # Strategy attribution (e.g. "DE-2026-04-22")
+    tag: Optional[str] = None               # Strategy attribution tag
 
 
 @dataclass(frozen=True)

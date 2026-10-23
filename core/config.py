@@ -25,11 +25,6 @@ CANDLES_DIR = STORAGE_DIR / "candles"
 SECTOR_INDICES_DIR = STORAGE_DIR / "sector_indices"
 ANALYST_REPORTS_DIR = STORAGE_DIR / "analyst_reports"
 FUNDAMENTALS_CACHE_DIR = STORAGE_DIR / "fundamentals_cache"
-JOURNAL_DIR = PROJECT_ROOT / "journal" / "data"
-
-# Runtime artifacts (gitignored, regenerated each session)
-DELIVERY_EDGE_STATE_FILE = STATE_DIR / "delivery_edge.json"
-EVENTS_TODAY_FILE = STATE_DIR / "events_today.json"
 
 
 # ── .env loading ─────────────────────────────────────────────────────────────
@@ -129,9 +124,8 @@ explicitly enabled via env var. Prevents accidental live trading during dev."""
 #
 # In the production system the tuned strategy parameters live here: the
 # drawdown band that defines a "fallen angel", the fundamental gate thresholds,
-# the sector-context cutoffs, and the scorecard levels (plus a second strategy's
-# intraday gates). These constitute the edge and are intentionally not
-# published. The modules that consume them keep their structure in this public
+# the sector-context cutoffs, and the scorecard levels. These constitute the
+# edge and are intentionally not published. The modules that consume them keep their structure in this public
 # edition; the calibrated numbers do not ship.
 
 
@@ -145,5 +139,5 @@ FALLBACK_CAPITAL_INR: float = 1_000_000.0   # Used when broker balance unavailab
 def ensure_dirs() -> None:
     """Create all runtime directories if missing. Call once at process start."""
     for d in [STATE_DIR, CANDLES_DIR, SECTOR_INDICES_DIR,
-              ANALYST_REPORTS_DIR, FUNDAMENTALS_CACHE_DIR, JOURNAL_DIR]:
+              ANALYST_REPORTS_DIR, FUNDAMENTALS_CACHE_DIR]:
         d.mkdir(parents=True, exist_ok=True)

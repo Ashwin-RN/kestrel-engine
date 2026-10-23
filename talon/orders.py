@@ -1,9 +1,10 @@
 """
 Order executor — places limit orders, records them, updates position book.
 
-Single-direction (BUY) for V1. Sells happen on stop/target/time-exit and
-land via a separate `exit_orders` module (Day 8). Both modules share the
-`OrderRecord` ledger at `state/orders/{YYYY-MM-DD}.json`.
+Entries are BUY limit orders placed when an entry machine confirms. Sells go
+through `place_exit` below: the take-profit machine (Apex) when it is armed, or
+the operator by hand. Loss-side exits are alert-only. Every order shares the
+`OrderRecord` ledger.
 
 The executor is **read-and-write safe**: every order is recorded BEFORE
 broker.place_order is called, so a crash mid-call leaves an auditable
@@ -125,25 +126,13 @@ def compute_tranche_qty(
 ) -> int:
     """Returns share count. Floors to lot_size; 0 means too small to deploy.
 
-    Applies the per-position ₹ cap from KESTREL_MAX_POSITION_INR if set —
-    the computed tranche notional is capped to that ceiling before lot-size
-    flooring. Used as a hard safety belt for early live trading.
+    The production system applies a per-name ceiling, expressed as a fraction
+    of equity, before this step. That ceiling is part of the sizing policy and
+    is withheld from the public edition.
     """
     if limit_price <= 0 or allocation_pct <= 0 or tranche_fraction <= 0:
         return 0
-    import os
     tranche_capital = capital_inr * (allocation_pct / 100.0) * tranche_fraction
-    cap_raw = (os.environ.get("KESTREL_MAX_POSITION_INR") or "").strip()
-    if cap_raw:
-        try:
-            cap = float(cap_raw)
-            if cap > 0 and tranche_capital > cap:
-                log.warning("[order] KESTREL_MAX_POSITION_INR=%.0f binds — "
-                            "capping tranche notional %.0f → %.0f",
-                            cap, tranche_capital, cap)
-                tranche_capital = cap
-        except (TypeError, ValueError):
-            log.warning("[order] KESTREL_MAX_POSITION_INR=%r unparseable — ignored", cap_raw)
     raw_qty = tranche_capital / limit_price
     qty = (int(raw_qty) // max(1, lot_size)) * max(1, lot_size)
     return max(0, qty)

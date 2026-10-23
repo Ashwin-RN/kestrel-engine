@@ -12,9 +12,9 @@ Per-symbol pipeline on each tick:
        → StateMachine.on_tick (invalidation guard)
        → StateMachine.on_15m_bar_close (entry-gate evaluation)
 
-State transitions are logged to console and persisted per-day to
-`state/watcher/state_machine_{YYYY-MM-DD}.json`. The watcher remains
-read-only — every transition is observational, no orders are placed.
+State transitions are logged to console and persisted per day. When a
+machine reaches its confirmation state the loop places the entry through
+Talon (paper by default). Exits are described at the exit-side hook below.
 
 Usage:
     python -m watcher.loop
@@ -57,10 +57,16 @@ MARKET_CLOSE = time(15, 30)
 # Fallback if symbol resolution fails (indices are on a different exchange).
 NIFTY_50_FALLBACK_TOKEN = 256265
 
-# Tuned macro severity cutoffs (the halt and crisis thresholds) are risk-posture
-# thresholds withheld from the public edition.
+# The macro severity cutoff that halts new entries is a tuned risk-posture
+# threshold withheld from the public edition. Macro never liquidates: at any
+# severity the gate blocks entries and nothing else.
 _MACRO_HALT_SEVERITY: Optional[int] = None
-_MACRO_CRISIS_SEVERITY: Optional[int] = None
+
+# The news-blackout window around a result filing and the candle lookback the
+# technicals refresh anchors on are tuned and withheld from the public edition.
+# With either left at None the corresponding step is skipped and says so.
+_NEWS_BLACKOUT_WINDOW_DAYS: Optional[int] = None
+_TECHNICALS_LOOKBACK_DAYS: Optional[int] = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -91,12 +97,14 @@ def _fetch_circuit_limits(broker, symbols: list[str]) -> dict[str, dict]:
     return out
 
 
-def _detect_news_blackout(broker, symbol: str, window_days: int = 2) -> Optional[date]:
+def _detect_news_blackout(broker, symbol: str, window_days: int) -> Optional[date]:
     """News-blackout window: returns the blackout-until date if a
-    `financial_result` filing landed in the last `window_days` days.
+    `financial_result` filing landed inside the last `window_days` days.
 
-    The state machine refuses to enter IN_ZONE while blackout is active —
-    fundamentals shocks routinely invalidate every technical level for 24-48h.
+    The state machine refuses to enter IN_ZONE while a blackout is active: a
+    fundamentals shock routinely invalidates every technical level for a while
+    after the filing. The production version fails closed (an unreadable feed
+    blocks the name); this earlier snapshot returns None on a fetch failure.
     """
     try:
         from data import filings as filings_mod
@@ -124,15 +132,18 @@ def _detect_news_blackout(broker, symbol: str, window_days: int = 2) -> Optional
     return blackout_until
 
 
-def _refresh_technicals(broker, symbol: str) -> Optional[dict]:
+def _refresh_technicals(broker, symbol: str, lookback_days: Optional[int]) -> Optional[dict]:
     """Pull fresh candles and recompute technicals. Buy zones must reflect
     today's reality, not the synth-time snapshot."""
     from strategies.fallen_angel.technicals import compute_technicals
+    if lookback_days is None:
+        log.warning("[%s] technicals lookback withheld from the public edition; refresh skipped", symbol)
+        return None
     try:
         inst = broker.instrument(symbol)
         today = date.today()
         candles = broker.historical_candles(
-            inst, today - timedelta(days=410), today, interval="day",
+            inst, today - timedelta(days=lookback_days), today, interval="day",
         )
         if candles.empty:
             log.warning("[%s] empty candles on refresh", symbol)
@@ -336,14 +347,14 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
     picks = load_active_picks(source_run=synth_path)
     if not picks:
         log.error("no active picks with structured entry_trigger — nothing to watch.")
-        log.error("re-run tests.probe_full_runthrough so Stage 4 produces structured "
+        log.error("re-run the research pass so Stage 4 produces structured "
                   "triggers, then restart the watcher.")
         return 2
 
     log.info("loaded %d picks from synth: %s", len(picks), ", ".join(p.symbol for p in picks))
 
     # ── Safety invariants — first thing on startup ────────────────────────
-    from talon.safety import assert_safety_invariants, reconcile_holdings, emergency_exit_all
+    from talon.safety import assert_safety_invariants, reconcile_holdings
     assert_safety_invariants()
 
     from broker.kite import KiteBroker
@@ -365,7 +376,7 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
         except Exception as e:
             log.warning("[%s] token resolve failed: %s", p.symbol, e)
             continue
-        tech = _refresh_technicals(broker, p.symbol)
+        tech = _refresh_technicals(broker, p.symbol, _TECHNICALS_LOOKBACK_DAYS)
         if tech is None:
             log.warning("[%s] skipping — no technicals", p.symbol)
             continue
@@ -387,20 +398,15 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
         try:
             macro = _compute_macro(broker, headlines=None)
         except Exception as e:
-            log.warning("macro compute failed: %s — defaulting to DRIFT severity 0", e)
+            log.warning("macro compute failed: %s, defaulting to the quiet regime", e)
             macro = None
     if macro is not None:
         log.info("MACRO: regime=%s severity=%d event=%s",
                  macro.regime, macro.severity, macro.event_type)
-        # The halt and crisis severity cutoffs are withheld from the public
-        # edition, so these guarded paths stay inert here.
+        # The halt cutoff is withheld from the public edition, so this guarded
+        # path stays inert here. Macro blocks entries; it never liquidates.
         if _MACRO_HALT_SEVERITY is not None and macro.severity >= _MACRO_HALT_SEVERITY:
             log.warning("  macro severity at/above the halt threshold — state machine will REFUSE new entries")
-        if _MACRO_CRISIS_SEVERITY is not None and macro.severity >= _MACRO_CRISIS_SEVERITY:
-            log.error("  macro CRISIS — kill switch active; emergency-exiting all open positions")
-            results = emergency_exit_all(broker, reason="MANUAL_EXIT")
-            for r in results:
-                log.error("    %s: %s", r.get("symbol"), r.get("status"))
 
     # ── Edge guards: circuit limits + news blackout ─────────────────────────
     circuit_limits = _fetch_circuit_limits(broker, list(fresh_tech.keys()))
@@ -408,11 +414,14 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
         log.info("[%s] circuit lower=%s upper=%s", sym, lim.get("lower"), lim.get("upper"))
 
     blackouts: dict[str, Optional[date]] = {}
+    if _NEWS_BLACKOUT_WINDOW_DAYS is None:
+        log.warning("news-blackout window withheld from the public edition; blackout check skipped")
     for sym in fresh_tech:
-        bo = _detect_news_blackout(broker, sym, window_days=2)
+        bo = (_detect_news_blackout(broker, sym, window_days=_NEWS_BLACKOUT_WINDOW_DAYS)
+              if _NEWS_BLACKOUT_WINDOW_DAYS is not None else None)
         blackouts[sym] = bo
         if bo:
-            log.warning("[%s] NEWS BLACKOUT active until %s (financial_result in last 48h)",
+            log.warning("[%s] NEWS BLACKOUT active until %s (result filing inside the blackout window)",
                         sym, bo.isoformat())
 
     nifty_token = _resolve_nifty_token(broker)
@@ -503,12 +512,11 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
                         paused_symbols=paused_for_disaster,
                     )
 
-                # Stop-loss enforcement intentionally disabled (2026-05-15).
-                # User is the stop-loss; Position.stop_price stays as a recorded
-                # advisory anchor surfaced in `positions list` but never triggers
-                # an auto-SELL. Catastrophic-move alert (separate path) handles
-                # disaster scenarios. Macro CRISIS sev=10 still fires
-                # emergency_exit_all via the safety layer.
+                # Loss-side exits are alert-only. Position.stop_price is a
+                # recorded advisory anchor surfaced in `positions list`; the stop
+                # and checkpoint paths write alert rows and the operator sells by
+                # hand. The catastrophic-move alert (separate path) covers the
+                # disaster case. Macro blocks entries and never liquidates.
             return handler
 
         def make_1h_handler(sym: str = p.symbol):
@@ -567,8 +575,7 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
                 log.info("[%s] T3 daily-HH check: not yet (%s)",
                          sym, sig.get("reason", "prev_close <= prior_high"))
 
-    # ── Exit-side: time-stop check + open-position monitoring ─────────────
-    from talon.orders import place_exit
+    # ── Exit-side: open-position monitoring ───────────────────────────────
     from positions.book import PositionBook
     exit_book = PositionBook.load()
     pos_by_sym: dict[str, "Position"] = {p.symbol: p for p in exit_book.open_positions()}
@@ -590,42 +597,13 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
             )
             log.info("[%s] held-only PerSymbolState initialised (no SM; alert-monitor only)", held_sym)
 
-    exited: set[str] = set()
-
-    def _try_place_exit(symbol: str, limit_price: float, reason: str) -> None:
-        if symbol in exited:
-            return
-        pos = pos_by_sym.get(symbol)
-        if pos is None or pos.total_qty <= 0:
-            return
-        try:
-            place_exit(
-                broker=broker, symbol=symbol, quantity=pos.total_qty,
-                limit_price=limit_price, reason=reason,
-                source_run=pick_by_sym.get(symbol).source_run if symbol in pick_by_sym else None,
-            )
-            exited.add(symbol)
-        except Exception as e:
-            log.exception("[%s] place_exit failed: %s", symbol, e)
-
-    # Time-stop check at startup
-    today_iso = date.today().isoformat()
-    for sym, pos in list(pos_by_sym.items()):
-        if pos.time_stop and pos.time_stop <= today_iso:
-            log.warning("[%s] time-stop expired (%s ≤ %s) — exiting at last close",
-                        sym, pos.time_stop, today_iso)
-            ltp = None
-            try:
-                ltp = broker.ltp_batch([sym]).get(sym)
-            except Exception as e:
-                log.warning("[%s] LTP fetch for time-stop failed: %s", sym, e)
-            if ltp:
-                _try_place_exit(sym, float(ltp), "TIME_EXIT")
-
-    # ── Exit-side monitoring (Apex) ───────────────────────────────────────
-    # In production the exit-side machine (Apex, the mirror of Fulcrum)
-    # evaluates each open position here once per session. Its module is omitted
-    # from this public subset, so the hook is left as a no-op.
+    # ── Exit side (Apex) ──────────────────────────────────────────────────
+    # In production the take-profit machine (Apex, the exit-side mirror of
+    # Fulcrum) evaluates each open position here. When it is armed by
+    # configuration it places the sell through Talon's place_exit; otherwise it
+    # writes an alert. Loss-side exits (the stop and the checkpoints) are
+    # alert-only: they write alert rows and the operator sells by hand. The Apex
+    # module is omitted from this public subset, so the hook is a no-op here.
 
     # ── Pre-market open: if we're past 9:15, fetch today's open ───────────
     if _in_market_hours():
@@ -700,15 +678,11 @@ def run(synth_path: Optional[Path] = None, status_only: bool = False) -> int:
                 except Exception as e:
                     log.exception("[%s] state machine on_tick failed: %s", sym, e)
 
-            # ── Target hit (intra-bar; targets are positive — catch fast) ──
+            # ── Take-profit side: owned by Apex (see the exit-side hook above) ──
             pos = pos_by_sym.get(sym)
-            if pos and sym not in exited and ltp >= pos.target_price > 0:
-                log.warning("[%s] TARGET HIT @ ₹%.2f >= ₹%.2f — placing exit",
-                            sym, ltp, pos.target_price)
-                _try_place_exit(sym, float(pos.target_price), "TARGET_HIT")
 
             # ── Catastrophic intraday move — halt + alert, NO auto-sell ──
-            # Anti-disaster floor (per-name stop-loss is intentionally absent).
+            # Anti-disaster floor (the per-name stop is alert-only).
             # Pauses Fulcrum on the name; user decides whether to exit.
             if (pos and sym not in paused_for_disaster
                     and catastrophic_threshold is not None

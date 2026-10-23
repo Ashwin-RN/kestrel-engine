@@ -26,3 +26,8 @@ logs/
 Thumbs.db
 .vscode/
 .idea/
+
+# Runtime state and regenerable data (never published)
+state/
+storage/
+vault/
