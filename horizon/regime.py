@@ -7,8 +7,8 @@ Architecture:
   tripwire thresholds in Python, with zero LLM tokens. On the rare day the
   tripwire fires (e.g. a policy speech, an election shock, a hawkish central-bank
   surprise), we wake the `horizon-macro-classifier` agent with a short set of
-  aggregated headlines and get a strict-JSON {regime, severity, root_cause}
-  back. That single small call is the entire macro-LLM budget. A headline
+  aggregated headlines and get a strict-JSON {severity, event_type,
+  root_cause} back; code maps the severity to a regime. That single small call is the entire macro-LLM budget. A headline
   keyword scan can also wake the classifier on a text shock that has not yet
   moved the indices.
 

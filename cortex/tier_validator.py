@@ -21,7 +21,7 @@ wrapped. Python, not the model, has the last word on the structural tier:
   inert shape (confidence caps a tier, it never defunds).
 
 The model stays in charge of narrative, tier and conviction; sizing belongs to
-the portfolio layer and prices to the deterministic entry geometry; the
+the portfolio layer and entry prices to the deterministic entry geometry; the
 structural tier decision is code-bound.
 
 Tier A criteria, by NAME: the gate ceiling must be A; a maximum diagnosis

@@ -5,14 +5,16 @@ Shape of the council today:
     Round 1 (R1):  Claude Opus emits the primary synthesis (the single-agent
                    Stage-5 path). The council consumes it; it does not re-run it.
 
-    Round 2 (R2):  two critic seats, OpenAI Codex and Claude, with a third
-                   model as a fallback seat (wired in the second contract),
-                   each read R1's output beside the original dossier input
-                   and emit STRUCTURED critiques. They never propose a
+    Round 2 (R2):  two critic seats, OpenAI Codex (with a second model
+                   behind it as a fallback, wired in the second contract)
+                   and Claude. Under the second contract each first reads
+                   the dossiers blind, then critiques R1's output beside that
+                   read, and emits STRUCTURED critiques. They never propose a
                    portfolio of their own.
 
     Ruling:        under the second council contract (the live one), an Opus
-                   arbiter rules on every critic finding (accept, partial,
+                   arbiter rules on every critic finding that asks for a
+                   change or a check (accept, partial,
                    reject or unresolved, with the basis), and CODE applies the
                    rulings to R1: it warns on every change and never hides one.
                    Under the first contract (kept as the rollback, and the path
@@ -47,7 +49,8 @@ Scope: this is for 6-18 month mean reversion; DCF and moat-style critiques do
 not fit here.
 
 Public edition: every critic, arbiter and revision prompt is withheld
-(`cortex.council_critic_prompt` and `cortex.critic_v2` are not published), as
+(`cortex.council_critic_prompt` is not published, and of `cortex.critic_v2`
+only the citation checker, `cortex/critic_v2/evidence.py`, is), as
 are the live seat-2 model selection and the contract switch (module-level
 constants below). The seat profiles live in `data.council_seat`, also not
 published.

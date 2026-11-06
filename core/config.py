@@ -78,7 +78,7 @@ OPENROUTER_API_KEY: Optional[str] = _env("OPENROUTER_API_KEY")
 
 # Which adapter the direct model interface uses ("claude_code_cli" | "anthropic"
 # | "ollama"). The default comes from the flag registry in core.flags.
-LLM_PROVIDER: str = (flags.raw("KESTREL_LLM_PROVIDER") or "anthropic").strip().lower()
+LLM_PROVIDER: str = (flags.raw("KESTREL_LLM_PROVIDER") or "claude_code_cli").strip().lower()
 
 # Anthropic models
 LLM_MODEL_PRIMARY: str = "claude-haiku-4-5-20251001"     # Default: fast, cheap, sufficient for scorecard

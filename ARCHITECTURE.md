@@ -15,8 +15,9 @@ The spine of the system is a single rule: **language models do the judgment,
 deterministic code holds the veto.** Models research, diagnose, rank, and
 critique. Arithmetic, thresholds, sizing, validation, and state transitions live
 in code. Nothing a model produces reaches a real order until it clears hard
-checks in plain Python, and nothing reaches new capital until a human has
-explicitly approved the name.
+checks in plain Python, nothing opens a new position until a human has
+explicitly approved the name, and adds to a held name stop on the operator's
+standing do-not-add or exit verdict.
 
 ## What this document discloses
 
@@ -62,7 +63,9 @@ flowchart LR
 ```
 
 The dotted edge is the one honest gap in the loop: memory is written on every
-run and read by the operator, but no analysis stage reads it back yet.
+run and read by the operator, but no analysis stage reads the per-name memory
+back yet. The one cross-week read-back today is the council's own issue
+ledger, which carries each critic warning until a later critic resolves it.
 
 ## Two orchestrations, one artifact
 
@@ -76,7 +79,8 @@ review chain. The weekend chain is a sequence of gated steps:
 preflight -> research run -> postcheck -> diff -> digest -> loss-side check
 ```
 
-Each step's exit code gates the next. Postcheck is a hard gate; a synthesis
+Each step's exit code gates the next, except the diff, which is advisory.
+Postcheck is a hard gate; a synthesis
 that fails it never reaches the watcher. After the digest the operator reviews
 each promotable name and records explicit approvals; on the next trading
 morning the live plan is rebuilt from those approvals plus the held book by its
@@ -90,7 +94,8 @@ Raw environmental data ingestion. No reasoning here, just acquisition.
 
 ### 1. Aperture
 The lens. Scans the broader NSE universe and narrows it to "fallen angels":
-quality names in deep drawdown that are worth deeper research.
+names in deep drawdown from their recent high that are worth deeper research.
+This stage measures only the fall; quality is judged by the stages after it.
 
 - **Agents**: none on the run path (pure Python). Universe maintenance uses an
   assigner-reviewer pair of agents (see Kernel).
@@ -99,8 +104,9 @@ quality names in deep drawdown that are worth deeper research.
   drawdown and sector.
 - **Public-safe note**: universe maintenance is separated from per-run
   screening, and the scan is rerunnable, cacheable, and auditable. A fresh
-  structural break (a demerger, a rebase) is taken out of the band before any
-  model sees the name; a held name goes to review instead. The inclusion
+  structural break such as a demerger, or a rebased name whose post-break fall
+  no longer qualifies, is taken out of the band before any model sees the
+  name; a held name goes to review instead. The inclusion
   rules, drawdown band, and rejected buckets are withheld.
 - **Failure modes**: stale universe list, split or dividend artifacts in price
   history (mitigated by a splice guard that re-fetches history on a close
@@ -110,10 +116,16 @@ quality names in deep drawdown that are worth deeper research.
 The peripheral nervous system. Turns noisy corporate and market information into
 structured evidence: filings, news, sub-sector context, and sentiment.
 
-- **Agents**: a weekly two-step sector thesis. A research agent gathers cited
-  evidence from the web and gives no verdict; code checks the citations; then a
-  verdict agent that cannot search judges whether each sector's fall is
-  temporary, cyclical or structural and must write a counter-case.
+- **Agents**: a two-step sector thesis for each sub-sector, refreshed weekly:
+  each sector is rebuilt when one of its triggers fires and otherwise keeps the
+  version in force. A research agent gathers cited evidence from the web and
+  gives no verdict. Code then drops evidence rows without a date, a quote or
+  an admitted source class, or dated after the run, flags stale and
+  single-source rows, and refuses a table with no search trail (the quotes
+  themselves are re-fetched against their pages in a separate deep-dive check
+  that annotates and never blocks). Then a verdict agent with
+  no web access judges whether each sector's fall is temporary, cyclical or
+  structural and must write a counter-case.
 - **Inputs**: corporate announcements, news, a FinBERT sentiment pipeline,
   filing text (PDF extraction with an OCR fallback), sector context.
 - **Outputs**: tagged filings, a sentiment volumetric (positive, negative and
@@ -124,9 +136,11 @@ structured evidence: filings, news, sub-sector context, and sentiment.
   it truncates, anchors every window to an explicit as-of date, and records a
   failed fetch as a failed fetch rather than an empty result.
 - **Failure modes**: news-result drift across calls, source timeouts, filing
-  keyword rules missing a new event type, and a news window that does not
-  always reach back to where the fall began (an open item). A per-day cache
-  stabilizes repeat runs.
+  keyword rules missing a new event type, and a fixed-length news window that,
+  for most names in a recent run, starts after the recent high and so misses
+  where the fall began. Each name is stamped with whether its window covers the
+  high, and fixing the window at the source is the open critical item. A
+  per-day cache stabilizes repeat runs.
 
 ### 3. Vector
 Proprioception of the prey. The speed, magnitude, and trajectory of price action,
@@ -152,19 +166,23 @@ is supportive, discounted, stressed, or in crisis.
 
 - **Agents**: a macro classifier that wakes only when a quantitative tripwire
   fires (an index move, or a geopolitical keyword scan), then reads aggregated
-  headlines and returns a strict-JSON regime, severity, and root cause. Idle
-  most days, cheap when it fires.
+  headlines and returns a strict-JSON severity, event type and root cause;
+  code maps the severity to a regime. Idle most days, cheap when it fires.
 - **Inputs**: benchmark index candles, optional headlines at tripwire time.
 - **Outputs**: a macro state (regime, severity on a small integer scale, event
-  type, root cause) with hysteresis so a single noisy day does not flip the
-  regime.
+  type, root cause) with event-day counters: an event that runs on consecutive
+  days raises the severity, and quiet days clear it. A single classified day
+  still sets that day's regime, which is one reason the operator override
+  exists.
 - **Public-safe note**: the design keeps a quantitative pre-filter in front of the
   LLM so tokens are spent only on genuine events. The tripwire levels and severity
   cutoffs are withheld.
-- **Where it binds**: only at the daily entry gate (at arm time and again at
-  every buy). The weekly research run records the regime beside its output but
-  never lets one day's read reshape the roster, and the operator can override
-  the read with a logged note. Macro blocks entries; it never liquidates.
+- **Where it binds**: only on the daily side: the morning plan build, the
+  arm-time gate and again at every buy. The weekly research run records the
+  regime beside its output but never lets one day's read reshape the roster,
+  and the operator can override the read with a logged note. Macro blocks
+  entries. At its most severe it marks held names for a sale the operator must
+  confirm; it never liquidates on its own.
 - **Failure modes**: beta instability across regimes, low-volatility false wakes,
   cap-band mis-mapping after a large drawdown.
 
@@ -180,9 +198,10 @@ The core. Evaluates the fundamental, peer-relative quality of a company: is it
 strong enough to deserve attention?
 
 - **Agents**: a peer-context agent, served by the bulk grader ladder.
-- **Inputs**: a fundamentals snapshot, a peer set, sector context from Pulse.
-- **Outputs**: a relative-strength verdict, the peer set, and a structured
-  scorecard.
+- **Inputs**: a fundamentals snapshot, a peer set, the name's sub-sector tag.
+- **Outputs**: a peer-strength label computed in code and handed to the agent
+  as an input, the agent's own label and narrative read, the peer set and a
+  structured scorecard. A post-run check warns when the two labels disagree.
 - **Public-safe note**: the peer set is chosen deterministically by market-cap
   proximity and is never widened; a thin cohort abstains rather than decides.
 - **Failure modes**: peer-set mis-selection, missing fundamentals, run-to-run
@@ -193,12 +212,13 @@ The autopsy. Diagnoses why a stock fell: a systemic shock, localized decay, or a
 benign cause. Separates recoverable dislocation from permanent impairment.
 
 - **Agents**: a news-diagnosis agent, served by the bulk grader ladder, that
-  reads the week's sector thesis and rules whether the fall is sector, market
+  reads the sector thesis in force and rules whether the fall is sector, market
   or company level. Its inputs are snapshotted and every diagnosis can be
   re-run on its exact recorded inputs against the same pinned grader, with no
   live fetch.
-- **Inputs**: filings and sentiment from Pulse, the sector thesis, peer drawdowns
-  from Nucleus.
+- **Inputs**: filings and sentiment from Pulse, the sector thesis, and sector
+  context measured in code (the name's fall against its peer cohort, its
+  sub-sector and the market).
 - **Outputs**: a fall-cause classification (company-specific, sector-wide, or
   mixed), a severity graded on recoverability rather than magnitude, a
   confidence, and a structured thesis. A diagnosis served by a fallback grader
@@ -217,17 +237,24 @@ produces a ranked decision set with reasons, risks, and rejections.
   constraints. The macro read is recorded beside the run, not fed to the model.
 - **Outputs**: ranked picks (tier and conviction), a rejected pile with
   reasoning, and portfolio notes. Entry levels are attached afterwards from
-  deterministic geometry, not written by the model.
+  deterministic geometry, not written by the model. The profit target is the
+  one price the model still writes, from a fixed rule in its instructions.
 - **Public-safe note**: Cortex combines deterministic gates with model-assisted
   review and keeps arithmetic, thresholds, and validation outside free-form model
   text. The gate list is published as an excerpt; the tier rules, cutoffs and
   expected-value formulas are withheld.
 
-**The Council.** A primary author (Opus) emits the ranked view. Two critic seats,
-OpenAI Codex and Claude (with a third model as a fallback seat), receive that
-output plus the original dossiers; each does a blind read, then a critique, in
-parallel. An Opus arbiter rules on each finding (accept, partial, reject or
-unresolved), and code applies the rulings: a name moves one step at most, never
+**The Council.** A primary author (Opus) emits the ranked view. Two critic
+seats, OpenAI Codex (a GPT model, with a second model behind it as a fallback)
+and Claude, work in parallel and never see each other. Each first reads the
+original dossiers blind, before it sees the author's output, with earlier
+weeks' open issues on its names; code answers its evidence lookups. It then
+critiques the author's output beside its own read, and code checks every fact
+the critique cites against the dossier the critic was shown
+([`cortex/critic_v2/evidence.py`](./cortex/critic_v2/evidence.py), an
+excerpt). An Opus arbiter rules on every finding that asks for a change or a
+check (accept, partial, reject or unresolved); a finding whose citation failed
+reaches it marked as such and can never overrule it. Code applies the rulings: a name moves one step at most, never
 above its gate ceiling, never when it is already held, and every accepted
 downgrade becomes a verify-before-approval flag. The council warns about what it
 changed and never hides it. One critic can fail (timeout, malformed output) and
@@ -244,7 +271,9 @@ ceiling on every name; the model's tier is clamped to it, and the ceiling is a
 maximum, never an assignment. A post-LLM validator re-checks the structural tier
 criteria in code and downgrades any pick that does not satisfy them, annotating
 the audit trail. The model stays in charge of narrative, tier and conviction;
-sizing belongs to Zenith and prices to the deterministic geometry.
+sizing belongs to Zenith and entry prices to the deterministic geometry. The
+profit target is still written by the synthesizer from a fixed rule and
+carried into the plan by Zenith.
 
 ---
 
@@ -270,8 +299,10 @@ then FIRED, INVALIDATED or EXPIRED) that places staged legs.
   macro severity, the resolved gate configuration, and a news blackout around
   result filings that fails closed: an unreadable feed blocks the name.
 - **Outputs**: persisted state transitions, fire records, and a logged refusal
-  for every gate that blocked a fire, each carrying the gate mode and a hash of
-  the whole gate configuration.
+  row for every fire-time gate block, naming the gate and carrying a hash of
+  the whole gate configuration, which a per-session header row resolves to each
+  gate's mode. Refusals that are not gates, such as a confirmed duplicate or an
+  unreadable broker, are recorded on the fire row itself.
 - **Public-safe note**: this is a timing layer, not a thesis generator. It
   separates research conviction from execution timing. Both machines show
   their rule structure in the published code; the calibrated thresholds are
@@ -282,10 +313,15 @@ then FIRED, INVALIDATED or EXPIRED) that places staged legs.
   watchdog and a restart supervisor).
 
 ### 9. Zenith
-The portfolio brain. A fully deterministic position sizer and risk-gate enforcer
-that bridges Cortex analysis and Fulcrum execution. It produces the day's
-execution plan: per-pick action, sized quantity, entry range, and stop and target
-levels, under capital and concentration constraints.
+The portfolio brain. A deterministic position sizer and risk-gate enforcer that
+bridges Cortex analysis and Fulcrum execution. It produces the day's execution
+plan: per-pick action, sized quantity, entry range, stop and target, under
+capital and concentration constraints. The code is deterministic, but two of
+its inputs are model judgements: quantity comes from a fixed allocation table
+keyed on the model's tier and conviction, and the price target is the
+synthesis model's, carried through (a chart-based fallback applies only when it
+is missing). The entry range comes from the deterministic geometry; the stop is
+computed here.
 
 - **Agents**: none (no LLM in the brain).
 - **Inputs**: the Cortex synthesis, the operator's recorded approvals, the
@@ -306,10 +342,13 @@ levels, under capital and concentration constraints.
 The peak. The exit-side mirror of Fulcrum, split out of Zenith into its own
 component. Fulcrum waits for selling to exhaust and a reversal up, then buys; Apex
 waits for recovery demand to exhaust and a roll-over, then sells. It is
-take-profit only and by construction never sells at or below entry.
+take-profit only: its exit floor sits above the entry price and scales with
+the synthesis model's target, and a fire-time check refuses any sale at or
+below the average entry price.
 
 States: HOLDING to VIGILANT to ARMED to EXHAUSTION_CONFIRMED to EXIT_FIRING to
-EXTRACTED, with an INVALIDATED back-edge.
+EXTRACTED, with a back-edge to ARMED when an exhaustion confirmation does not
+persist.
 
 - **Agents**: none (deterministic).
 - **Public-safe note**: Apex mirrors entry discipline on the exit side. It can run
@@ -317,8 +356,10 @@ EXTRACTED, with an INVALIDATED back-edge.
   its trigger formulas are withheld. The exit posture is asymmetric by design:
   the loss side is alert-only (the stop and the checkpoints write alert rows
   and the operator sells by hand), while this take-profit machine can be armed
-  to sell. Preflight asserts the armed set in both directions, so neither side
-  can drift from the declared posture unnoticed.
+  to sell. Preflight asserts every exit rung in both directions (each
+  loss-capable sell declared alert-only; the take-profit, the exit chase and
+  the stop's ex-date belt declared armed) and fails on drift, so neither side can drift from the declared
+  posture unnoticed. Entry-side drift warns rather than fails.
 - **Failure modes**: trailing too tight in early recovery, and a daily-bar cadence
   that lags a fast intraday distribution (the price floor is already watched
   intraday; the executed-volume signal at tick cadence is the open upgrade).
@@ -331,7 +372,8 @@ Order placement, the record of truth, long-term memory, and day-to-day operation
 
 ### 10. Talon
 The strike. The controlled edge between internal intent and the broker. Limit
-orders only, paper by default.
+orders only; paper mode unless the live-trading switch is on, as it is in the
+live system.
 
 - **Agents**: none (deterministic).
 - **Inputs**: Fulcrum and Apex signals, the plan, the live-trading flag, and
@@ -346,7 +388,10 @@ orders only, paper by default.
   gated by it. At fire time a cash gate, a minimum order size and a minimum fill
   fraction each refuse with a logged reason; a duplicate-order defence checks
   both the ledger and broker truth; every price is snapped onto the exchange
-  tick grid at one chokepoint; and a master kill switch gates live orders.
+  tick grid at the order chokepoints; and a master kill switch gates live
+  orders (a separate panic command sells every position). Order fills are
+  polled from the broker while the loop runs, and the book is compared against
+  broker holdings every morning.
   Retry rules and the exit chase's parameters are withheld.
 - **Failure modes**: partial fills (a partial fill disables the automated
   opening for that name), broker rejection codes, double-record on a mid-call
@@ -364,13 +409,14 @@ and what the system actually did.
 - **Failure modes**: drift versus broker holdings (surfaced, operator-resolved),
   manual-edit corruption, partial fills mis-recorded.
 
-**Validation ledger.** Beside the position record, a validation ledger grades
-every weekly cohort at fixed horizons against questions the operator
+**Validation ledger.** Beside the position record, a validation ledger records
+every weekly cohort's outcome at fixed horizons, against questions the operator
 pre-registered before any outcome resolved. Outcomes are insert-only, the
-scoreboard reports spreads rather than verdicts, and every comparison is keyed
-by the grader era that produced the decision. It is advisory and never gates a
-run; capital moves to the next rung only when those pre-registered bars are
-met.
+scoreboard reports spreads rather than verdicts, and every decision row is
+stamped with the grader era that produced it so eras can be split before
+comparing. It is advisory and never gates a run. Capital rungs are meant to
+move only on those pre-registered bars; several bars are still awaiting
+ratification, and the first half-year read is still ahead.
 
 ### 12. Engram
 The neural memory trace. A per-symbol markdown dossier that accumulates what the
@@ -395,12 +441,17 @@ observability.
 - **Agents**: a taxonomy auditor, and an assigner-reviewer pair (Opus assigns,
   Codex reviews) for bucketing new listings.
 - **Public-safe note**: Kernel runs validation gates before downstream actions are
-  allowed and provides repeatable run rituals driven as skills over
-  deterministic scripts. Every gate resolves into one fingerprinted manifest,
-  and preflight fails if the armed set drifts from the declared one in either
-  direction. The test suite cannot spend money, spawn a real model CLI, or
-  touch live state. The commands, schedules, notification channels, and
-  runbooks are withheld.
+  allowed and provides repeatable run rituals driven as seventeen Claude Code
+  skills over deterministic scripts (named in the README; their contents are
+  not published). Every gate resolves into one fingerprinted manifest, and
+  preflight fails if the exit arming drifts from the declared set in either
+  direction. The test suite blocks paid model calls and real model CLI spawns,
+  runs against a throwaway state tree, and a tripwire fails a test that writes
+  a live state file (the order ledger always; files the live loop is busy
+  rewriting are skipped during market hours); real orders are out of reach because the
+  live-trading switch is scrubbed, not because a separate guard refuses a
+  broker call. The commands, schedules and runbooks are withheld; alerts
+  surface in the operator's working session, with no push channel.
 - **Failure modes**: the runbook drifting behind code, a missing check for a
   recently added component.
 
@@ -409,13 +460,16 @@ observability.
 ## LLM plumbing (cross-cutting)
 
 One thin interface serves every model call. Four provider paths sit behind it:
-Anthropic via the API and the Claude CLI (project agents by name, and a prompt
-mode for the council seat), the OpenAI Codex CLI (read-only sandbox), OpenRouter
-(GLM), and Google Gemini. The bulk-graded stages walk a declared ladder: an
-OpenRouter GLM model first, then Gemini, then Claude. Any agent falls from
-Claude to its Codex twin on a rate limit, except that a weekly cap on the
+Anthropic via the Claude CLI (project agents by name, and a prompt mode for the
+council seat; an API adapter is kept as an alternate), the OpenAI Codex CLI
+(read-only sandbox), OpenRouter (GLM), and Google Gemini. The bulk-graded
+stages walk a declared ladder: an OpenRouter GLM model first, then Gemini, then
+each agent's pinned Claude model (Sonnet for the bulk graders). On a Claude
+session limit a call waits and retries; on a weekly cap or a repeated timeout
+an agent with a Codex twin falls to it, except that a weekly cap on the
 protected synthesizer raises unless the operator has armed an escape hatch to
-its Codex twin (armed in the live system). Every served row is
+its Codex twin (armed in the live system). The Claude critic seat and the
+arbiter never fall back to Codex. Every served row is
 stamped with the model that produced it, and a fallback-served diagnosis goes
 to manual review. A model change is a fresh run, never a resume.
 
@@ -426,8 +480,9 @@ mechanism is stamped into run metadata. Two caveats keep this honest: user-scope
 notes still load, and the project-agent path keeps account-level connectors
 attached.
 
-Every agent prompt has two copies (one per CLI vendor); a parity test fails on
-drift between them.
+Every agent the code can route to Codex or Gemini has two prompt copies (one
+for Claude, one read by Codex and the Gemini tier); a parity test fails on drift
+between them and on a bulk-graded agent missing either copy.
 
 ## Stack
 
@@ -440,15 +495,20 @@ drift between them.
   experiments, off the live path.
 - Deterministic rule engines for gates, risk checks, sizing, and validation.
 - FinBERT for news sentiment.
-- Schema validation and contract-style tests around artifacts that cross module
-  boundaries.
+- Schema validation and a contract test on the synthesis seam; postcheck
+  catches output-side breakage.
 - Audit-first state: decisions, intents, outcomes, and reviews are durable
   artifacts, plus a SQLite validation ledger.
 - Filing enrichment: PDF text extraction with an OCR fallback.
 - Test belts that block paid model calls and real model CLIs from the test
   suite.
-- Cloud-ready separation between core logic, adapters, operations, and runtime
-  state.
+- Separation between core logic, adapters, operations, and runtime state;
+  today it runs on a single Windows laptop, and a cloud move is parked.
+- Claude Code as the operator console: seventeen skills over deterministic
+  scripts, and a deep-dive procedure driven in chat
+  ([`docs/DEEP_DIVE.md`](./docs/DEEP_DIVE.md)).
+- Zerodha Kite Connect end to end: price history, live ticks, limit orders,
+  holdings, positions and reconciliation, behind a pre-open static-IP check.
 
 ## Honest limits
 
@@ -456,8 +516,8 @@ drift between them.
 - There is no full-pipeline backtest harness; validation is forward-only.
 - There is no portfolio-level risk module beyond the per-name ceiling and the
   sector cap.
-- The two orchestrators can drift in artifact shape; there are no cross-stage
-  contract tests yet.
+- The two orchestrators can drift in artifact shape; only the synthesis seam
+  has a contract test, and stage-to-stage shapes are otherwise informal.
 - The devil's-advocate agent is built and unwired.
 - No CI: decided, not built.
 - The trend gate and the index-gate proxy run in shadow, undecided.

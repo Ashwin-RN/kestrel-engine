@@ -26,6 +26,196 @@ thresholds, scoring weights, allocation tables, the sector cyclicality model,
 and the universe rules) is deliberately excluded. See
 [what is not here](#whats-not-here-and-why).
 
+A walkthrough of one real week, in the same order as the
+[accompanying deck](https://drive.google.com/file/d/1sGGJwQEA5jeiXJqwLeTxYFlp5S_PK15u/view),
+is in [How it runs](#how-it-runs).
+
+## How it runs
+
+One operator, one laptop, a weekly research batch, and a live intraday loop on
+the operator's own capped capital (live since May 2026). AI agents research,
+code enforces the rules, and a human approves every new position. The figures
+below are from one weekly run, 31 Oct 2026.
+
+### The bet: fallen angels
+
+A fallen angel here is a good business whose share price fell further than its
+problems justify. Three kinds of fallen stock look alike on a chart: a fallen
+angel (a candidate), a falling knife (it may be good but is still falling, so
+entry waits for the fall to stop), and a value trap (cheap because it is
+broken). No single step labels a stock as one of the three; the pipeline asks
+four questions that separate them:
+
+1. How far did it fall, against peers of similar size that fell too?
+2. Is its sector's problem temporary or structural?
+3. Is the company stronger or weaker than those peers?
+4. Why did it fall, and how badly?
+
+### The weekly funnel (31 Oct 2026)
+
+| Step | Count | Done by |
+|---|---|---|
+| NSE stocks screened | 1,573 | code |
+| Fell far enough to qualify; a research file built for each | 870 | code |
+| Graded by the bulk model (GLM Flash on OpenRouter); then code dropped 2 on the grader's own corporate-action tag (a demerger and a merger) | 868 kept, every one GLM-served, no backup used | model, then code |
+| Passed the hard rules before the committee (code removed 320: 304 that failed several rule families, 16 on two code checks of the bulk grader's tags and the entry levels) | 548 | code |
+| Rated Tier A or B by the committee | 167 (11 A, 156 B) | models, checked by code |
+| Picks after code's per-sector cap | 96 | code |
+| Deep dive, one stock at a time | the top tiers | agents |
+| Approved for new capital (1 Nov) | none | the operator |
+
+Code sets a ceiling on every stock from its numbers. A model can lower a
+stock's tier but never lift it above that ceiling; on this run no final tier
+sat above its ceiling.
+
+### The analyst bench: one tag per question
+
+1. **Fall against peers (code).** The fall is measured against a market-cap
+   peer cohort in the same sub-sector.
+2. **Is the sector's problem temporary? (agents and code).** Each of 47
+   sub-sectors has a cited thesis, re-checked weekly and rebuilt when one of its
+   triggers fires (12 rebuilt and 35 carried forward for this run). A research
+   agent gathers evidence and gives no verdict; code drops evidence rows
+   without a date, a quote or an admitted source class, or dated after the
+   run, flags stale and single-source rows, and refuses a table with no search
+   trail; a verdict agent with no web access judges. Quotes are re-fetched against their pages during the deep
+   dive.
+3. **Stronger or weaker than peers? (code and model).** Code scores the peers
+   and computes a data label that the model sees beside the numbers; the model
+   writes its own label, and a post-run check flags where the two disagree
+   (they agreed on 750 of 868).
+4. **Why did it fall, and how badly? (model).** The diagnosis rules the fall
+   company, sector, market or mixed, grades severity on recoverability, flags
+   red flags in filings, and reads the sector thesis.
+
+The bulk grader costs about a twentieth of a US cent per call on average, with
+a backup ladder behind it. Every tag is stamped with the model that served it;
+diagnosis tags also carry a hash of their inputs and a snapshot, so they re-run
+on identical inputs, and a model swap cannot mix two models' tags unseen.
+
+### The committee
+
+An Opus drafter ranks the 548 survivors into tiers. Two critics from different
+vendors, a GPT model through OpenAI Codex and Claude, first read the evidence
+blind (without the draft and without each other), then critique the draft, in
+parallel. Code checks every fact a critique cites against the dossier the
+critic was shown
+([`cortex/critic_v2/evidence.py`](./cortex/critic_v2/evidence.py)); it checks
+the quoted value, not the reasoning. An Opus
+arbiter rules on each finding that asks for a change or a check, and code
+applies the rulings: one tier step at most, never above the ceiling, never on a
+held name, and every accepted downgrade goes onto the operator's verify list. A
+finding whose citation fails can never overrule the arbiter. A downgrade flags
+a pick; it never deletes one, because in a pre-launch replay a web check judged
+3 of 5 sampled accepted demotions unjustified (thin or unread evidence read as
+bad news). On this run all 13 batches were reviewed by both critics. One critic
+down and the run continues, marked degraded; both critics or the arbiter down
+and the run refuses to save.
+
+### The deep dive
+
+After the committee, candidates from the top tiers go through an agentic
+investment committee meeting, one stock at a time (the full meeting runs on
+the names the operator selects; others stop after a first read): a brief of
+everything the machine believes, labelled as claims; an Opus lead analyst who reads the filings and
+returns a provisional verdict with ranked open questions; specialist agents
+that each take one question and one source and return settled, still open, or
+cannot be settled; and a Claude Code session that reconciles, asks what the
+first framing missed, and writes a verdict per stock before the next starts.
+Every claim is labelled (fact, inference, forecast, contradiction, not found).
+At most five agents run at once and agents cannot start agents, by standing
+rule. The procedure, and which parts of it code enforces, is in
+[`docs/DEEP_DIVE.md`](./docs/DEEP_DIVE.md).
+
+### The human in the loop
+
+The operator makes one decision: which stocks may receive new money. Approval
+is explicit, by name, in Claude Code, and anything not approved is dropped.
+Code refuses the approval of a stock that is not already held unless it carries
+a recorded deep-dive verdict, or a named override that the record keeps; on a
+run that served the sector thesis it also needs a ruled check of that thesis,
+and a sector read against the stock needs a stated reason. The approved list is
+the only way into a new stock. Adds to a held stock follow a standing per-name
+verdict (hold, add, do not add, exit pending), and only the last two stop an
+add. A closed position leaves the list on its own, and the list never gates a
+sale. On 1 Nov nothing was approved, the
+list stayed empty, and no automated opening could fire.
+
+### Execution
+
+- **Fulcrum (when to buy).** Watches live prices and waits for the fall to
+  stop; a news blackout around results filings blocks the name, and fails
+  closed.
+- **Zenith (how much).** A fixed table turns the committee's tier and
+  conviction into a size, under a per-name ceiling and a sector cap. No model
+  picks the number, and no human does either.
+- **Talon (the order).** Limit orders only. At the moment of firing it
+  re-checks the approved list for openings and the cash, blocks duplicates
+  against the ledger and the broker, and refuses with a logged reason. A master
+  switch stops live orders; a separate panic command sells everything.
+- **Apex (take profit).** Exit rules set in advance, fired by code: its floor
+  sits above the entry price and scales with the profit target the drafter
+  proposes.
+- **Losses.** The stop and the checkpoints alert; the operator decides and
+  sells by hand. This changed after live experience, and the morning preflight
+  fails if any exit rung drifts from that posture in either direction.
+- **Reconciliation.** Order fills are polled from the broker while the loop
+  runs, and every morning the position book is compared against broker
+  holdings; drift is reported, never auto-corrected.
+
+Entry prices moved from a model to code after an offline comparison, and the
+model path stays as a one-line rollback.
+
+### The stack
+
+- **Data:** NSE (stock list, corporate filings), BSE (listing dates), Screener
+  (fundamentals), Google News (headlines, scored with FinBERT), web search (the
+  sector theses), and Zerodha Kite (price history).
+- **Broker, end to end:** Zerodha Kite Connect for live prices, limit orders,
+  holdings and positions, and reconciliation. SEBI's retail algo rules,
+  enforced from 1 April 2026, require a registered static IP for API orders, so a pre-open check catches a
+  changed public IP before an order can be rejected.
+- **Models, each in a named seat:** Claude Opus (drafter, critic, arbiter,
+  sector research and verdict, deep-dive agents), a GPT model through OpenAI
+  Codex (critic), GLM Flash on OpenRouter (bulk grading), and Gemini (backup
+  tier). Only the OpenRouter and Gemini calls are metered (the bulk grading,
+  plus fallbacks that were not used on this run): 81 US cents on the 31 Oct
+  run, under two and a half US dollars on each recent full run. The Opus and
+  GPT calls run on flat-rate subscriptions.
+- **Claude Code as the console:** seventeen skills drive the operation, each a
+  thin wrapper over deterministic scripts: sweep, sweep-preflight,
+  sweep-postcheck, sweep-diff, saturday-digest, post-sweep,
+  engram-refresh-queue, confirm-picks, sector-analysis, daystart,
+  watcher-launch, watcher-arm, reconcile, catastrophic-check, gates,
+  engram-review, and a login skill (login from the IDE). The skills themselves
+  are not published.
+
+### Measured, not believed
+
+- Before GLM took the bulk-grading seat it was replayed on 200 past prompts,
+  and it went live within the week. Not every seat change has had that
+  treatment: the current Claude critic seat was a straight live swap, and a
+  tool that replays every seat change is scoped.
+- A validation ledger records every week's decisions and what each stock did
+  at fixed horizons, against questions written before any result; the first
+  half-year read is still ahead.
+- About 8,000 offline tests run in the private tree. None can call a real
+  model or spend on model APIs.
+- A filing-search feature was built on a branch and benchmarked on held-out
+  questions: keyword search found the answering filing slightly more often
+  than today's dossier, but its "not enough evidence" check failed, so it stays
+  off the live run.
+- A measured gap: on 552 of the 868 stocks, the fixed-length news window
+  started after the 52-week high, so it missed where the fall began. Fixing
+  that at the source is the open critical item.
+
+### Boundaries
+
+Personal use only: recommending stocks to others needs SEBI registration, so
+no picks are shared. It is not built to scale (one operator, one laptop, a
+weekly batch on personal model plans); scaling would mean a server with a fixed
+IP, a job queue, and, for other users, a licence.
+
 ## Engineering principles
 
 The whole design exists to keep judgment and authority separate. The model can
@@ -73,7 +263,7 @@ Fulcrum waits for mechanical   ->   Talon checks safety, records intent,
     watcher/campaign.py)               reconciled against the broker
                                               |
                                               v
-Apex watches the winner and     ->   a validation ledger grades every cohort
+Apex watches the winner and     ->   a validation ledger records every cohort
    takes profit (apex/)                against pre-registered questions
                                        (validation/)
 ```
@@ -81,30 +271,38 @@ Apex watches the winner and     ->   a validation ledger grades every cohort
 Concrete examples of the boundary in this repo:
 
 - **Adversarial council.** An Opus author ranks; two critic seats (OpenAI
-  Codex and Claude, with a third model as a fallback seat) each do a blind read
-  and then a critique, in parallel; an Opus arbiter rules on each finding; code
-  applies the rulings and turns every accepted downgrade into a
-  verify-before-approval flag. One critic can fail and the batch proceeds
+  Codex, a GPT model, and Claude, with a third model as the fallback behind the
+  Codex seat) each do a blind read and then a critique, in parallel; code checks
+  every fact a critic cites against the dossier it read; an Opus arbiter rules
+  on each finding that asks for a change or a check; code applies the rulings
+  and turns every accepted downgrade into a verify-before-approval flag. One critic can fail and the batch proceeds
   degraded and uncached; if the arbiter or both critics fail, the run refuses to
   persist rather than ship an unreviewed synthesis.
   [`cortex/council.py`](./cortex/council.py) shows the seat abstraction, the
-  input-size guard and the hand-off to the arbiter contract; the arbiter
-  contract's own modules and every prompt are not published.
+  input-size guard and the hand-off to the arbiter contract, and
+  [`cortex/critic_v2/evidence.py`](./cortex/critic_v2/evidence.py) is the
+  citation check (an excerpt); the rest of the arbiter contract's modules and
+  every prompt are not published.
 - **Code overrules the model.** A gate stack sets a ceiling on every name; the
   model's tier is clamped to it, and the ceiling is a maximum, never an
   assignment. When the LLM assigns a tier its own inputs do not support,
   deterministic Python downgrades it and annotates why. See
   [`cortex/gates_v1.py`](./cortex/gates_v1.py) (an excerpt, thresholds
   withheld) and [`cortex/tier_validator.py`](./cortex/tier_validator.py).
-- **The LLM never sets a price.** Entry levels come from a deterministic
-  geometry anchored to the recent low, with both bounds, computed in
-  [`strategies/fallen_angel/stage4_geometry.py`](./strategies/fallen_angel/stage4_geometry.py).
-  The model's tier only selects which entry profile applies
-  ([`zenith/entry_profiles.py`](./zenith/entry_profiles.py)). An LLM
-  interpreter that used to write the triggers remains only as a declared
-  rollback.
-- **Multi-provider orchestration.** One interface over Anthropic (API and the
-  Claude CLI), OpenAI Codex, OpenRouter (GLM) and Google Gemini, with a declared
+- **Code sets every entry price and the stop.** Entry levels come from a
+  deterministic geometry anchored to the lowest low of a fixed lookback
+  window, with both bounds, computed in
+  [`strategies/fallen_angel/stage4_geometry.py`](./strategies/fallen_angel/stage4_geometry.py);
+  the stop is computed in Zenith. The one model-written price is the profit
+  target: the synthesizer proposes it from a fixed rule in its instructions,
+  the plan carries it, and Apex derives its arming level and its minimum-gain
+  floor from it. The model's tier and conviction select which entry profile
+  applies ([`zenith/entry_profiles.py`](./zenith/entry_profiles.py)) and, through
+  a fixed table, the size. An LLM interpreter that used to write the entry
+  triggers remains only as a declared rollback.
+- **Multi-provider orchestration.** One interface over Anthropic (the Claude
+  CLI, with a direct API path built but not on the live path), OpenAI Codex,
+  OpenRouter (GLM) and Google Gemini, with a declared
   fallback ladder; every answer is stamped with the model that served it, and a
   fallback-served diagnosis goes to human review. Model processes are spawned
   from an isolated working directory so the repository's operator notes never
@@ -119,7 +317,8 @@ Concrete examples of the boundary in this repo:
   sessions; the legacy machine is rebuilt each morning), and both refuse to
   arm a name under a news blackout that fails closed
   ([`watcher/blackout.py`](./watcher/blackout.py)).
-- **Safety belts at the boundary.** Limit-only orders, paper by default, an
+- **Safety belts at the boundary.** Limit-only orders, paper unless the
+  live-trading switch is on (as it is in the live system), an
   operator-approved list for new capital that prunes itself on exit
   ([`talon/whitelist_prune.py`](./talon/whitelist_prune.py)), a fire-time cash
   gate, a minimum order size and a minimum fill fraction, a sector cap, a
@@ -129,10 +328,12 @@ Concrete examples of the boundary in this repo:
   reconciliation, all fail-loud. Exits are never gated by the approved list.
   See [`talon/safety.py`](./talon/safety.py) and
   [`talon/orders.py`](./talon/orders.py).
-- **Measured, not believed.** A validation ledger grades every weekly cohort
-  at fixed horizons against questions the operator pre-registered before any
-  outcome resolved; it is advisory and never gates a run, and capital moves
-  only when those bars are met. See [`validation/`](./validation/).
+- **Measured, not believed.** A validation ledger records every weekly
+  cohort's decisions and their outcomes at fixed horizons. A scoreboard reports
+  the spreads for questions the operator pre-registered before any outcome
+  resolved; it states no verdicts, and the first full-horizon read is still
+  ahead. It is advisory and never gates a run, and capital moves only when
+  those pre-registered bars are met. See [`validation/`](./validation/).
 
 ## How it was built: method over feature
 
@@ -154,15 +355,19 @@ scale. The ten that shaped it most:
    from the declared posture in either direction.
 4. **Provenance on every model-graded row.** Bulk grading runs on a declared
    provider ladder; each row records which model graded it, a fallback-graded
-   row is routed to a human, and the outcome ledger keys every comparison by
-   grader era.
+   row is routed to a human, and the outcome ledger records the grader on
+   every row so any comparison can be split by grader era.
 5. **Two lists and four invariants for real money.** New capital requires an
-   explicit, verification-backed human approval; adds to held positions follow
+   explicit human approval backed by a recorded verification or a named,
+   recorded override; adds to held positions follow
    the book and a standing verdict; a closed name is pruned from the list
    unconditionally; the list gates openings only, never exits.
 6. **Judgment split from search.** Sector theses come from an evidence call
-   that cannot judge and a verdict call that cannot search, with code verifying
-   every citation between them; the weekly research run only loads the result.
+   told only to collect evidence and a verdict call with no web access. Between
+   them code drops evidence rows without a date, a quote or an admitted source
+   class, or dated after the run, flags stale and single-source rows, and
+   refuses a table with no search trail; a separate check compares each quote
+   with its cited page. The weekly research run only loads the result.
 7. **Moving logic from model to code on evidence.** Entry geometry moved from
    an LLM interpreter to deterministic Python after an offline comparison, with
    the model path kept as a one-line rollback.
@@ -178,7 +383,10 @@ scale. The ten that shaped it most:
     exact recorded inputs against the same pinned grader, with no live fetch;
     every gate resolves to one hashed manifest
     that is checked against the documentation each morning; and the test suite
-    cannot spend money, spawn a real model CLI, or touch live state.
+    cannot spend money or model quota (paid-model keys are scrubbed, the
+    OpenRouter host and real model CLIs are refused), runs against a temporary state tree with a
+    tripwire on the live files, and keeps orders simulated because the
+    live-trading switch is scrubbed. No separate guard refuses a broker call.
 
 ## Component map
 
@@ -217,10 +425,10 @@ published; the roster is.
 
 | Agent | Role | Vendor | On the live path |
 |---|---|---|---|
-| Portfolio synthesizer | Ranks the shortlist into tiers with conviction, entry and exit zones | Claude Opus (Codex twin on a weekly cap) | Yes, weekly research run |
-| Council seat 1 | Critic: blind read, then critique | OpenAI Codex (GLM on OpenRouter as fallback) | Yes |
+| Portfolio synthesizer | Ranks the shortlist into tiers with conviction and a profit target; entry prices are passed through from code | Claude Opus (Codex twin on a weekly cap) | Yes, weekly research run |
+| Council seat 1 | Critic: blind read, then critique | OpenAI Codex, a GPT model (GLM on OpenRouter as fallback) | Yes |
 | Council seat 2 | Critic: blind read, then critique | Claude Opus | Yes |
-| Council arbiter | Rules on each critic finding; code applies | Claude Opus | Yes |
+| Council arbiter | Rules on each critic finding that asks for a change or a check; code applies | Claude Opus | Yes |
 | News diagnosis | Rules whether the fall is sector, market or company level, against the sector thesis | Bulk ladder: GLM on OpenRouter, then Gemini, then Claude | Yes |
 | Peer context | Compares one name against its market-cap peers | Bulk ladder | Yes |
 | Sector research | Gathers cited evidence for one sub-sector; no verdict | Claude Opus, web on | Yes, weekly sector job |
@@ -236,8 +444,8 @@ published; the roster is.
 
 A weekend research run (the probe) scans the universe, builds dossiers, runs
 the council and writes a preview plan; the operator then reviews each
-promotable name and records explicit approvals. A midweek job refreshes the
-sector theses from fresh closes. Each weekday morning a pre-market chain
+promotable name and records explicit approvals. A job after Thursday's close
+refreshes the sector theses from fresh closes. Each weekday morning a pre-market chain
 re-authenticates, reconciles the book against the broker, rebuilds the live
 plan from the approved names and the held book, and runs preflight; the
 intraday loop launches at the open and stops at the close. Nothing in the
@@ -256,10 +464,12 @@ kestrel-engine/
   horizon/     Macro regime classifier with tripwire and hysteresis
   cortex/      Gate framework (excerpt), council orchestrator (excerpt),
                tier validator, sweep-time macro flagging
+    critic_v2/
+      evidence.py          The council's citation check (excerpt)
   strategies/
     fallen_angel/
       technicals.py        Deterministic indicator library (calibration withheld)
-      stage4_geometry.py   The Python-owned entry band (excerpt)
+      stage4_geometry.py   The Python-owned entry band (constants withheld)
   zenith/      Plan schema, entry profiles, risk gates (sizer withheld)
   watcher/     Live tick loop (excerpt), the two entry machines, bar
                aggregation, synth and plan selection, news blackout,
@@ -271,11 +481,12 @@ kestrel-engine/
   engram/      Long-term per-symbol memory dossiers
   validation/  Outcome ledger schema, liveness heartbeat, scoreboard (excerpts)
   tools/       One example tool: the broker-bar settlement check
+  docs/        The deep-dive procedure
 ```
 
-Modules marked "excerpt" are published at a few hundred lines from much larger
-private files; they keep the signatures, the state names and the ordered gate
-chains and drop the bulk.
+Modules marked "excerpt" are cut to a fraction of much larger private files;
+they keep the signatures, the state names and the ordered gate chains and drop
+the bulk.
 
 ## Design notes
 
@@ -309,6 +520,8 @@ These are architectural facts, not a roadmap.
 - **No CI.** Decided, not built. The test belts run locally.
 - **Shadow gates are undecided.** A per-stock trend filter and an index-gate
   proxy are measured, not enforced, until the ledger says which way to go.
+- **One machine.** It runs from a single Windows laptop on the operator's own
+  model subscriptions; a cloud move is parked.
 - **Pilot scale.** Live with real money, tightly capped, with the approved-list
   belt as a shakedown measure meant to be retired once the early cycles are
   declared clean. Capital moves on evidence, never on a date.
@@ -330,8 +543,9 @@ deliberately excluded, because they are the edge:
 - **Universe rules.** Inclusion filters and the screened candidate set.
 - **Live and historical positions, fills, PnL, and account data.**
 - **Operational material.** Run commands, environment variables beyond the
-  three in the public flag registry, local paths, alert channels, the preflight
-  and postcheck suites, and runbooks.
+  three in the public flag registry, local paths, the preflight
+  and postcheck suites, the Claude Code skills' contents, the test suite, and
+  runbooks.
 
 The model providers are named on purpose. Showing Opus as the author, Codex and
 Claude as critic seats, and an Opus arbiter whose rulings code applies is part

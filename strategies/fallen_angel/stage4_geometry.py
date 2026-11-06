@@ -1,7 +1,7 @@
 """Stage-4 entry geometry v2: the low-anchored band, Python only.
 
-Stage 4 owns entry prices. In v2 no language model sets a price: the band is a
-pure function of completed daily candles.
+Stage 4 owns entry prices. In v2 no language model sets an entry price: the
+band is a pure function of completed daily candles.
 
   L             the lowest LOW of a calendar-day lookback window that ends at
                 the last COMPLETED session, with its date. Never a close.

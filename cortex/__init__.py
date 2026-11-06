@@ -2,8 +2,9 @@
 
 Cortex judges quality and value and ranks the candidate set. It does not decide
 timing (Fulcrum owns entries, Apex owns the take-profit exit), it does not size
-(Zenith owns sizing) and it does not set prices (the deterministic Stage-4
-geometry owns entry levels).
+(Zenith owns sizing) and it does not set entry prices (the deterministic
+Stage-4 geometry owns entry levels). The one price the synthesizer proposes is
+the profit target, from a fixed rule in its instructions.
 
 This package also houses the hard boolean gate framework that anchors the
 synthesis: numeric judgment lives in deterministic Python, and the language

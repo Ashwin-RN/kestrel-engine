@@ -75,8 +75,10 @@ FLAGS: dict[str, Flag] = {f.name: f for f in [
          "The operator-approved new-capital list (comma-separated). It gates "
          "openings only, never exits; an empty list means no opening fires.",
          safety_critical=True),
-    Flag("KESTREL_LLM_PROVIDER", "anthropic", lambda r: (r or "anthropic").strip().lower(),
-         "Which adapter the direct model interface uses."),
+    Flag("KESTREL_LLM_PROVIDER", "claude_code_cli",
+         lambda r: (r or "claude_code_cli").strip().lower(),
+         "Which adapter the direct model interface uses: the Claude CLI by "
+         "default, with the Anthropic API and a local model as alternates."),
 ]}
 
 
